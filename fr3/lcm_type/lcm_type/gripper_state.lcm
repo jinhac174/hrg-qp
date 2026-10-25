@@ -1,0 +1,13 @@
+package gripper;
+
+// Gripper state (libfranka's GripperState fields) plus command bookkeeping.
+struct gripper_state_t
+{
+    double timestamp;
+    float width;          // current opening width [m]
+    float max_width;      // calibrated max width [m]
+    boolean is_grasped;   // an object is held within the GRASP epsilon window
+    boolean busy;         // a MOVE / GRASP / HOMING is in progress
+    int32_t last_seq;     // seq of the most recently completed command
+    boolean last_success; // result of that command
+}

@@ -1,0 +1,50 @@
+<mujoco model="franka_fr3_real_cell">
+  <include file="fr3_robotiq_robot.xml"/>
+
+  <compiler angle="radian"/>
+
+  <option timestep="0.001" integrator="implicitfast"/>
+
+  <asset>
+    <texture type="skybox" builtin="gradient"
+             rgb1="0.3 0.5 0.7" rgb2="0 0 0"
+             width="512" height="3072"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 -0.1 1.5" dir="0 0.2 -1"
+           diffuse="0.7 0.7 0.7" specular="0.3 0.3 0.3"
+           directional="true" castshadow="true"/>
+
+    <!-- The real (DROID) cell for the collision-aware controllers, published by
+         run_hardware.py (and by the sim env, to try it in MuJoCo first).
+         Robot base frame: +x front, +y left, z up from the mounting surface.
+
+         The walls are VIRTUAL: nothing is there physically. contype /
+         conaffinity 0 keeps them out of MuJoCo's physics too, so in the sim,
+         as on the robot, only the controller keeps the arm away from them.
+
+         floor       top face at z = 0.02 (2 cm above the base: safety margin)
+         wall_front  inner face at x = 0.85
+         wall_left   inner face at y = +0.50
+         They span the enclosure: x -0.28 .. 0.85, y -0.45 .. 0.50, z 0.02 .. 1.235.
+
+         Collision volumes (invisible, rgba alpha 0): 0.5 m thick behind each
+         inner face, so the signed distance stays right while a link is inside.
+         What you see are the glass_* panes on the inner faces (visual only:
+         the scene exporter takes floor / wall_* / table* / obs_* geoms). -->
+    <geom name="floor" type="box" size="0.565 0.475 0.25" pos="0.285 0.025 -0.23"
+          contype="0" conaffinity="0" rgba="0 0 0 0"/>
+    <geom name="wall_front" type="box" size="0.25 0.475 0.6075" pos="1.10 0.025 0.6275"
+          contype="0" conaffinity="0" rgba="0 0 0 0"/>
+    <geom name="wall_left" type="box" size="0.565 0.25 0.6075" pos="0.285 0.75 0.6275"
+          contype="0" conaffinity="0" rgba="0 0 0 0"/>
+
+    <geom name="glass_floor" type="box" size="0.565 0.475 0.003" pos="0.285 0.025 0.017"
+          contype="0" conaffinity="0" group="1" rgba="0.67 0.84 0.94 0.18"/>
+    <geom name="glass_front" type="box" size="0.003 0.475 0.6075" pos="0.853 0.025 0.6275"
+          contype="0" conaffinity="0" group="1" rgba="0.67 0.84 0.94 0.18"/>
+    <geom name="glass_left" type="box" size="0.565 0.003 0.6075" pos="0.285 0.503 0.6275"
+          contype="0" conaffinity="0" group="1" rgba="0.67 0.84 0.94 0.18"/>
+  </worldbody>
+</mujoco>

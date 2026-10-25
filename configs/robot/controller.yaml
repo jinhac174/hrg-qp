@@ -1,0 +1,36 @@
+# The controller on the real FR3, on top of configs/controller.yaml:
+#   python run_controller.py --config configs/controller.yaml configs/robot/controller.yaml \
+#       --object_config configs/objects/blue_bowl.yaml
+env_mode: real
+grasp:
+  grasp_trigger_dist: 0.015   # paper: 1.5 cm on the robot (pose estimation noise)
+# Gamma(q): the real cell's (virtual) floor and walls, published by
+# run_hardware.py from assets/robot/scene_real_cell.xml.
+col_pairs:
+  - [fr3_link2, wall_front]
+  - [fr3_link2, wall_left]
+  - [fr3_link3, wall_front]
+  - [fr3_link3, wall_left]
+  - [fr3_link3, floor]
+  - [fr3_link4, wall_front]
+  - [fr3_link4, wall_left]
+  - [fr3_link4, floor]
+  - [fr3_link5, wall_front]
+  - [fr3_link5, wall_left]
+  - [fr3_link5, floor]
+  - [fr3_link5__2, wall_front]
+  - [fr3_link5__2, wall_left]
+  - [fr3_link5__2, floor]
+  - [fr3_link6, wall_front]
+  - [fr3_link6, wall_left]
+  - [fr3_link6, floor]
+  - [fr3_link7, wall_front]
+  - [fr3_link7, wall_left]
+  - [fr3_link7, floor]
+  - [fr3_link7__2, wall_front]
+  - [fr3_link7__2, wall_left]
+  - [fr3_link7__2, floor]
+  - [fr3_gripper, wall_front]
+  - [fr3_gripper, wall_left]
+  - [fr3_gripper__2, wall_front]
+  - [fr3_gripper__2, wall_left]

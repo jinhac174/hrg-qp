@@ -1,0 +1,89 @@
+# Real FR3 + Robotiq 2F-85, the DROID setup (run_hardware.py). Publishes / subscribes the same
+# channels as configs/sim/env.yaml, so controllers run unchanged
+# (configs/robot/controller.yaml sets env_mode: real).
+name: franka_fr3
+
+hardware_freq: 1000        # Hz this process updates the torque (panda-py holds it at 1 kHz)
+gripper_state_freq: 30     # Hz gripper state / gripper joint are published (one Modbus read each)
+
+robot:
+  backend: pandapy         # pandapy = the robot; fake = no robot (testing this process)
+  hostname: 192.168.0.113  # FR3 control box (FCI) IP: DROID cell (droid/misc/parameters.py robot_ip)
+  # true: move to the default pose [0, 0, 0, -pi/2, 0, pi/2, 0] before torque
+  # control (panda-py joint motion at 20% speed). Keep the user stop in hand.
+  move_to_start: true
+  # The FR3 stops itself (reflex, red lights) when the estimated EXTERNAL
+  # torque / wrench exceeds these. panda-py's defaults (torque [20 20 18 18 16
+  # 14 12] Nm, force [20 20 20 25 25 25] N / Nm) trip as soon as you push the
+  # arm hard. These leave room for the paper's pushes.
+  collision_thresholds:
+    torque: [60, 60, 54, 54, 40, 36, 30]
+    force: [60, 60, 60, 40, 40, 40]
+  # Desk > Settings > End effector: set the load to the gripper, 0.925 kg with
+  # its centre of mass 0.052 m along the flange z axis; the FR3's gravity
+  # compensation uses it.
+  # Who holds the arm against gravity. hrg/controller.py always sends
+  # g(q) + C(q, qdot) qdot from gravity_urdf's model, so this must be
+  # "controller": the FR3's own compensation is cancelled every tick. A
+  # command without gravity on the big joints is refused (the arm keeps
+  # holding); the hold (no fresh command) uses gravity_urdf.
+  gravity_model: controller
+  gravity_urdf: assets/robot/urdf/fr3_robotiq_rigid.urdf
+  # Extra load on top of Desk's (DROID: wrist ZED camera + 3D-printed mount,
+  # off the gripper axis: without it the arm sinks in some wrist poses).
+  # Measure it with scripts/robot/identify_payload.py (run_hardware stopped) and
+  # uncomment:
+  # load:
+  #   mass: 0.15             # kg
+  #   com: [0.0, 0.0, 0.0]   # m, flange frame
+
+gripper:
+  backend: auto            # robotiq = the 2F-85 over USB (Modbus RTU); fake = simulated;
+                           # auto = robotiq, or fake together with --robot.backend fake
+  # Its USB / RS-485 adapter: on THIS computer (/dev/ttyUSB0), or, as in the
+  # DROID cell, on the NUC, bridged to TCP by scripts/robot/robotiq_tcp_bridge.py.
+  port: socket://192.168.0.127:5020
+  activate_on_start: true  # activation closes and opens the fingers once: keep them clear
+
+# Collision geometry of the cell, published by this process (as the sim env
+# does) for the collision-aware controllers and Viser. Describe the cell in the
+# scene XML: floor, wall_*, table*, obs_* geoms. Remove the block to publish
+# nothing; hrg's controller waits for it, so keep it.
+scene_info:
+  scene_xml_path: assets/robot/scene_real_cell.xml
+  static_col_info_channel: franka_static_col_info
+  robot_col_info_channel: franka_robot_col_info
+  rate: 10.0   # Hz
+
+safety:
+  # Torque limits (Nm), at most the FR3 limits [87 x4, 12 x3].
+  tau_max: [87, 87, 87, 87, 12, 12, 12]
+  # Max torque change (Nm/s). libfranka itself rejects torque discontinuities.
+  tau_rate_max: 1000.0
+  # q_des is clamped to q +/- this (rad): a controller that jumps its set-point
+  # far away only gets a bounded spring force.
+  max_joint_error: 0.1
+  # Joint speed limits (rad/s). velocity_limit: brake = damp the speed above
+  # the limit (vel_brake_kd, Nm per rad/s of excess) and keep following the
+  # controller; stop = hold the pose until you press h.
+  max_joint_vel: [2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0]
+  velocity_limit: brake
+  vel_brake_kd: [20, 20, 20, 20, 5, 5, 2]
+  # No command for this long (s): hold the current pose with hold_kp / hold_kd.
+  ctrl_timeout: 0.1
+  hold_kp: [300, 300, 300, 300, 125, 75, 25]
+  hold_kd: [35, 35, 35, 15, 15, 15, 7]
+
+sub_manager:
+  name: franka
+  ctrl_channel: franka_arm_joint_ctrl
+  gripper_cmd_channel: franka_gripper_cmd
+  num_joints: 7
+  max_sub_freq: 2000
+
+pub_manager:
+  name: franka
+  arm_joint_meas_channel: franka_arm_joint_meas
+  gripper_joint_meas_channel: franka_gripper_joint_meas
+  gripper_state_channel: franka_gripper_state
+  max_pub_freq: 2000

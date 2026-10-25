@@ -1,0 +1,153 @@
+# The reactive grasp controller (hrg/controller.py) in simulation.
+# Robot: --config configs/controller.yaml configs/robot/controller.yaml
+ctrl_freq: 1000
+plan_freq: 100              # the paper's planner rate
+env_mode: sim_real_time
+
+urdf_path: assets/robot/urdf/fr3_robotiq_rigid.urdf
+default_q_values: [0.0, 0.0, 0.0, -1.5707963, 0.0, 1.5707963, 0.0]   # home (key h)
+# Same file as the env's object_config: mesh, distance function (sdf) and
+# fingertip targets (scripts/prepare_objects.py).
+object_config: configs/objects/blue_bowl.yaml
+
+# ---------------------------------------------------------------- the method (hrg/planner.py)
+hrg:
+  field: path              # path: eqs. (3)-(5); linear: the eq. (2) baseline
+  # eq. (5): fingertip speed
+  v_const: 0.15            # m/s far from the target
+  delta_x: 0.05            # m, quadratic slow-down radius
+  # eq. (2) baseline: K = linear_gain * I
+  linear_gain: 1.0         # 1/s
+  # eq. (3): fingertip paths (paper Sec. II-D)
+  num_knots: 100
+  num_via_samples: 100     # via directions for the initial 2-segment path
+  via_dist: 0.10           # m, via point this far from the target
+  sqp_iters: 3             # SQP iterations per plan
+  sqp_step_bound: 0.02     # m, SQP trust region per knot and iteration
+  max_separation: 0.085    # m, |c1(s) - c2(s)| <= the 2F-85's opening
+  eps_obj: 0.01            # m, target object (paper: 1 cm)
+  eps_obs: 0.05            # m, obstacles (paper: 5 cm)
+  eps_table: 0.01          # m
+  # eq. (12): target selection, sum of fingertip distances + w * angle
+  select_w_angle: 0.05     # m per rad
+  # eqs. (6)-(8): grasp stability (identically zero on the 2F-85)
+  eta_g: 0.15              # rad
+  T_g: 0.05
+  # eqs. (9)-(10): gripper posture
+  w_nominal: 0.085         # m, open
+  v_gr: 0.10               # m/s
+  delta_gr: 0.02           # m
+  eta_h: 0.06              # m: below this fingertip error the posture field fades out
+  T_h: 0.02
+  # eq. (11): QP
+  horizon: 0.05            # s, H
+  qp_reg: 0.001            # z^T z regulariser (the cost has rank 6 of 8 once alpha, beta -> 0)
+  qp_eps_obj: 0.01         # m, hand spheres vs target object
+  qp_eps_obs: 0.02         # m, hand spheres vs obstacles
+  qp_eps_table: 0.005      # m, hand spheres vs table
+  sep_rate_max: 0.25       # m/s, demanded separation rate when inside a margin
+
+# Gamma(q) of eq. (11): robot vs environment (the scene's floor / wall_* geoms,
+# published by the env / run_hardware.py) and vs itself.
+joint_velocity_limit: [2, 2, 2, 2, 2.5, 2.5, 2.5]
+env_col_margin: 0.02
+self_col_margin: 0.02
+# The hand's own boxes are not checked against the floor: the hand spheres vs
+# table rows do that (qp_eps_table), so fingertips can reach low targets.
+col_pairs:
+  - [fr3_link2, wall_back]
+  - [fr3_link2, wall_left]
+  - [fr3_link3, wall_back]
+  - [fr3_link3, wall_left]
+  - [fr3_link3, floor]
+  - [fr3_link4, wall_back]
+  - [fr3_link4, wall_left]
+  - [fr3_link4, floor]
+  - [fr3_link5, wall_back]
+  - [fr3_link5, wall_left]
+  - [fr3_link5, floor]
+  - [fr3_link5__2, wall_back]
+  - [fr3_link5__2, wall_left]
+  - [fr3_link5__2, floor]
+  - [fr3_link6, wall_back]
+  - [fr3_link6, wall_left]
+  - [fr3_link6, floor]
+  - [fr3_link7, wall_back]
+  - [fr3_link7, wall_left]
+  - [fr3_link7, floor]
+  - [fr3_link7__2, wall_back]
+  - [fr3_link7__2, wall_left]
+  - [fr3_link7__2, floor]
+  - [fr3_gripper, wall_back]
+  - [fr3_gripper, wall_left]
+  - [fr3_gripper__2, wall_back]
+  - [fr3_gripper__2, wall_left]
+# Self-collision: the pairs Franka's SRDF leaves enabled.
+self_col_pairs:
+  - [fr3_link5, fr3_link0]
+  - [fr3_link5__2, fr3_link0]
+  - [fr3_link6, fr3_link0]
+  - [fr3_link7, fr3_link0]
+  - [fr3_link7__2, fr3_link0]
+  - [fr3_gripper__2, fr3_link0]
+  - [fr3_gripper, fr3_link0]
+  - [fr3_link5, fr3_link1]
+  - [fr3_link5__2, fr3_link1]
+  - [fr3_link6, fr3_link1]
+  - [fr3_link7, fr3_link1]
+  - [fr3_link7__2, fr3_link1]
+  - [fr3_gripper__2, fr3_link1]
+  - [fr3_gripper, fr3_link1]
+  - [fr3_link5, fr3_link2]
+  - [fr3_link5__2, fr3_link2]
+  - [fr3_link7, fr3_link2]
+  - [fr3_link7__2, fr3_link2]
+  - [fr3_gripper__2, fr3_link2]
+  - [fr3_gripper, fr3_link2]
+  - [fr3_gripper__2, fr3_link5]
+  - [fr3_gripper, fr3_link5]
+  - [fr3_gripper__2, fr3_link5__2]
+  - [fr3_gripper, fr3_link5__2]
+
+# ---------------------------------------------------------------- grasp, lift, home
+grasp:
+  table_z: 0.0
+  grasp_trigger_dist: 0.01 # m, both fingertips this close: close (paper: 1 cm sim, 1.5 cm robot)
+  grasp_force: 30.0        # N
+  grasp_speed: 0.1         # m/s
+  gripper_timeout: 3.0     # s
+  lift_height: 0.15        # m
+  lift_tol: 0.01           # m
+  lift_timeout: 5.0        # s
+  lift_speed: 0.15         # m/s
+  lift_angular_speed: 0.8  # rad/s
+  lift_pos_gain: 3.0       # 1/s
+  lift_rot_gain: 2.0       # 1/s
+  lift_rot_weight: 0.5
+home_gain: 1.0             # 1/s
+
+# ---------------------------------------------------------------- low level (hrg/controller.py)
+# tau = kp (q_des - q) + kd (qdot_des - qdot) + g(q) + C(q, qdot) qdot, q_des += qdot_des dt
+kp: [600, 600, 600, 600, 250, 150, 50]
+kd: [50, 50, 50, 20, 20, 20, 10]
+qd_filter: 0.25            # first-order filter on qdot_des per control tick
+max_ref_err: 0.05          # rad, |q_des - q| bound
+max_plan_age: 0.2          # s, no new plan for this long: qdot_des = 0
+width_stream_freq: 50.0    # Hz, move set-points to the gripper while reaching
+width_max_lead: 0.01       # m, w_ref stays this close to the measured width
+
+sub_manager:
+  arm_joint_meas_channel: franka_arm_joint_meas
+  gripper_state_channel: franka_gripper_state
+  static_col_info_channel: franka_static_col_info
+  robot_col_info_channel: franka_robot_col_info
+  object_pose_channel: franka_object_pose
+  obstacles_channel: franka_obstacles
+  max_sub_freq: 2000
+
+pub_manager:
+  ctrl_channel: franka_arm_joint_ctrl
+  gripper_cmd_channel: franka_gripper_cmd
+  fingertip_channel: franka_hrg_fingertips
+  fingertip_paths_channel: franka_hrg_paths
+  max_pub_freq: 2000

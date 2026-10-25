@@ -1,0 +1,13 @@
+# run_visualizer.py (hrg/viz.py): live 3-D view in the browser.
+urdf_path: assets/robot/urdf/fr3_robotiq.urdf    # [arm (7), 2F-85 driver]; the linkage mimics
+object_mesh: assets/objects/blue_bowl/visual.obj # the object in use
+vis_freq: 30
+host: 127.0.0.1            # 0.0.0.0: viewable from another computer
+port: 8080
+channels:
+  arm_joint_meas: franka_arm_joint_meas
+  gripper_joint_meas: franka_gripper_joint_meas
+  object_pose: franka_object_pose
+  obstacles: franka_obstacles
+  fingertips: franka_hrg_fingertips
+  fingertip_paths: franka_hrg_paths

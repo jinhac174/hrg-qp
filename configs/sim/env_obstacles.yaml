@@ -1,0 +1,11 @@
+# Paper Fig. 8: four boxes moving around the object (on top of configs/sim/env.yaml):
+#   python run_env.py --config configs/sim/env.yaml configs/sim/env_obstacles.yaml
+object_config: configs/objects/wine_glass.yaml
+obj_spawn_xy_half: [0.01, 0.01]
+jump_xy_half: [0.02, 0.02]
+# Box half extents, centre of motion, amplitude (x, y), frequency (Hz), phase.
+obstacles:
+  - {half: [0.03, 0.05, 0.06], centre: [0.36, 0.16, 0.06], amp: [0.0, 0.06], freq: 0.12, phase: 0.0}
+  - {half: [0.03, 0.05, 0.06], centre: [0.36, -0.16, 0.06], amp: [0.0, 0.06], freq: 0.10, phase: 1.5}
+  - {half: [0.05, 0.03, 0.06], centre: [0.64, 0.17, 0.06], amp: [0.06, 0.0], freq: 0.08, phase: 3.0}
+  - {half: [0.05, 0.03, 0.06], centre: [0.64, -0.17, 0.06], amp: [0.06, 0.0], freq: 0.11, phase: 4.5}

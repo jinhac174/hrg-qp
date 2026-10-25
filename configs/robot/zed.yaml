@@ -1,0 +1,81 @@
+# The DROID cameras: two ZED 2 on the sides of the table + a ZED Mini on the
+# wrist (run_sensors.py, on the computer they are plugged into; needs the ZED
+# SDK + pyzed). Find the serials with the ZED SDK's ZED_Explorer --all
+# (or on the camera's label).
+#
+# Each camera publishes RGB-D on its channel (RGB uint8, depth uint16 in mm)
+# and camera info on <channel>_info: the intrinsics are read from the camera,
+# the extrinsics (tf_link_to_cam) come from here.
+name: zed
+num_sensors: 3
+info_pub_freq: 30
+
+zed:
+  ext1:
+    serial: 36776608       # ZED 2i on the workstation (0 = not used: skipped)
+    resolution: HD720      # capture mode: HD2K / HD1080 / HD720 / VGA
+    width: 640             # published size (0 = native 1280x720); 640x360 keeps
+    height: 360            #   the image messages small and FoundationPose fast
+    frequency: 30
+    depth_mode: NEURAL     # NEURAL / ULTRA / QUALITY / PERFORMANCE
+    fixed: true
+    attached_body: world
+    # Extrinsic = world (robot base) -> camera transform, i.e. T_world2cam:
+    # x_cam = R x_base + t (OpenCV camera axes: x right, y down, z forward).
+    # NOT the camera's pose in the base (that is its inverse, T_cam2base);
+    # perception computes cam2world = inv(this). Placeholder: calibrate it
+    # (franka_visual_servoing tutorial 14 prints "Est T_world2cam") and paste the result here.
+    # Calibrated 2026-10-19 (franka_visual_servoing tutorial 14, AprilTag + 8 views; held-out IoU 0.83,
+    # outline 5.5 px): outputs/calibration/zed_ext1_20261019_175121.
+    tf_link_to_cam:
+      quaternion: [-0.107620, 0.769256, -0.625249, -0.075671]   # x, y, z, w
+      translation: [0.345402, 0.364876, 0.742801]
+  ext2:
+    serial: 0              # SET: ZED 2, right side of the table
+    resolution: HD720
+    width: 640
+    height: 360
+    frequency: 30
+    depth_mode: NEURAL
+    fixed: true
+    attached_body: world
+    tf_link_to_cam:
+      quaternion: [0.0, 0.0, 0.0, 1.0]
+      translation: [0.0, 0.0, 0.0]
+  wrist:
+    serial: 11049903       # ZED Mini on the wrist (from its USB descriptor)
+    resolution: HD720
+    width: 640
+    height: 360
+    frequency: 30
+    depth_mode: NEURAL
+    min_depth_mm: 100      # the ZED Mini sees closer than the ZED 2
+    image_flip: false      # true: rotate 180 deg (mounted upside down). Recalibrate T_link_cam if changed
+    # Moves with the arm. CAUTION, direction: for the fixed cameras above
+    # tf_link_to_cam is T_world2cam (= T_cb, base -> camera). For this camera
+    # the mount is T_link_cam (= T_lc, the camera's pose IN fr3_link8, OpenCV
+    # axes), and its pose in the base at image time t is
+    #     T_bc(t) = FK_fr3_link8(q(t)) @ T_link_cam
+    # (franka_visual_servoing tutorial 16). The camera-info
+    # extrinsic this camera publishes is NOT its pose (it moves): consumers
+    # must compute T_bc from the joints. Calibrate T_link_cam with
+    # franka_visual_servoing scripts/calibrate_wrist.py and paste its block here.
+    fixed: false
+    attached_body: fr3_link8
+    T_link_cam:            # calibrated 2026-10-20 (outputs/calibration/wrist_20261020_220416.npz)
+      quaternion: [0.098722, -0.110460, 0.716760, -0.681401]   # x, y, z, w
+      translation: [-0.068245, 0.041394, 0.029241]
+    tf_link_to_cam:        # unused for a moving camera (camera-info placeholder)
+      quaternion: [0.0, 0.0, 0.0, 1.0]
+      translation: [0.0, 0.0, 0.0]
+
+pub_manager:
+  name: zed
+  zed:
+    ext1_channel: zed_ext1
+    ext2_channel: zed_ext2
+    wrist_channel: zed_wrist
+  max_pub_freq: 100
+sub_manager:
+  name: base
+  max_sub_freq: 100

@@ -1,0 +1,22 @@
+package gripper;
+
+// Gripper command, in metres / newtons (the libfranka gripper API; the Robotiq
+// 2F-85 driver, robot_platform/hardware/franka_fr3/robotiq.py, maps it):
+//   MOVE   : move(width, speed)
+//   GRASP  : grasp(width, speed, force, epsilon_inner, epsilon_outer)
+//   STOP   : stop()
+//   HOMING : homing()  (calibrates max_width)
+// Each new command must carry a new seq; the receiver executes a seq once.
+struct gripper_cmd_t
+{
+    const int32_t MOVE = 0, GRASP = 1, STOP = 2, HOMING = 3;
+
+    double timestamp;
+    int32_t seq;
+    int32_t mode;
+    float width;          // target opening width [m], 0 .. max_width
+    float speed;          // [m/s]
+    float force;          // grasp force [N] (GRASP only)
+    float epsilon_inner;  // grasp succeeds if width_target - eps_inner <= width
+    float epsilon_outer;  //   <= width_target + eps_outer  (GRASP only)
+}

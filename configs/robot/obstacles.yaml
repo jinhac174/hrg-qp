@@ -1,0 +1,5 @@
+# scripts/robot/publish_obstacles.py: boxes on the table, robot base frame
+# (measure them; e.g. tissue boxes as in the paper's Fig. 11).
+channel: franka_obstacles
+obstacles:
+  - {centre: [0.40, 0.20, 0.06], half: [0.06, 0.12, 0.06], yaw: 0.0}
