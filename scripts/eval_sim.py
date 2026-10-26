@@ -94,13 +94,13 @@ def env_args(env_cfgs, obj: str, pose: str, seed: int, orientation: str):
             "--obj_spawn_rpy", _vec(ORIENTATIONS[orientation])]
 
 
-def ctrl_args(obj: str, field: str):
+def ctrl_args(obj: str, field: str, extra=()):
     return ["run_controller.py", "--config", CTRL_CFG, "--object_config", f"configs/objects/{obj}.yaml",
-            "--hrg.field", field]
+            "--hrg.field", field, *extra]
 
 
 def run_trial(out: Path, obj: str, pose: str, seed: int, field: str, timeout: float, env_cfgs=(ENV_CFG,),
-              push_at=(), jump_at=(), orientation: str = "upright") -> dict:
+              push_at=(), jump_at=(), orientation: str = "upright", ctrl_extra=()) -> dict:
     row = dict(object=obj, orientation=orientation, pose=pose, seed=seed, field=field, success=False,
                t_grasp=np.nan, t_lift=np.nan, ft_err=np.nan, infra=False)
     with Listener(CHANNELS) as lst, Procs(out) as procs:
@@ -110,7 +110,7 @@ def run_trial(out: Path, obj: str, pose: str, seed: int, field: str, timeout: fl
             return row
         lst.spin(1.0)
         z0 = float(lst.last["franka_object_pose"].position[2])
-        ctrl = procs.start("ctrl", *ctrl_args(obj, field))
+        ctrl = procs.start("ctrl", *ctrl_args(obj, field, ctrl_extra))
         if not lst.wait_for(lambda: lst.count["franka_arm_joint_ctrl"] > 500, 90):
             row["note"], row["infra"] = "controller did not start", True
             return row
@@ -172,6 +172,8 @@ def main():
     ap.add_argument("--fields", nargs="*", default=["path"])
     ap.add_argument("--timeout", type=float, default=20.0)
     ap.add_argument("--env", nargs="*", default=[], help="extra env configs on top of configs/sim/env.yaml")
+    ap.add_argument("--ctrl", nargs="*", default=[], metavar="KEY=VALUE",
+                    help="controller config overrides, e.g. --ctrl hrg.horizon=0.15 grasp.lift_height=0.2")
     ap.add_argument("--push_at", type=float, nargs="*", default=[])
     ap.add_argument("--jump_at", type=float, nargs="*", default=[])
     ap.add_argument("--out", default=None)
@@ -180,6 +182,7 @@ def main():
     out = Path(args.out or os.path.join(REPO, "outputs", "eval", time.strftime("%Y%m%d_%H%M%S")))
     out.mkdir(parents=True, exist_ok=True)
     env_cfgs = [ENV_CFG, *args.env]
+    ctrl_extra = [a for kv in args.ctrl for a in ("--" + kv.split("=", 1)[0], kv.split("=", 1)[1])]
     rows = []
     for field in args.fields:
         for obj in args.objects:
@@ -188,7 +191,7 @@ def main():
                     for _ in range(3):
                         wait_for_lcm()
                         r = run_trial(out / f"{field}_{obj}_{ori}_{pose}_{seed}", obj, pose, seed, field,
-                                      args.timeout, env_cfgs, args.push_at, args.jump_at, ori)
+                                      args.timeout, env_cfgs, args.push_at, args.jump_at, ori, ctrl_extra)
                         if not r["infra"]:
                             break
                         print(f"  infra problem ({r.get('note')}), retrying", flush=True)

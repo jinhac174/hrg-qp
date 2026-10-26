@@ -129,10 +129,22 @@ s.t.   Γ(q) + dΓ/dz z H >= ε_Γ                     robot vs walls / floor, r
        |qdot| <= qdot_max,  |wdot| <= 150 mm/s
 ```
 
-* `H = 0.05` s. Margins: object 1 cm, obstacles 2 cm, table 5 mm, Γ 2 cm.
+* `H = 0.10` s. Margins: object 1 cm, obstacles 2 cm, table 5 mm, Γ 2 cm.
   When a pair is already inside its margin, the demanded separation rate
   `(ε − d)/H` is capped at 0.25 m/s so the QP stays feasible while it
   recovers.
+  **[FR3 + 2F-85]** The paper leaves `H` to the user ("`H` and the margins
+  control the conservativeness"). Linearised over `H`, a distance row lets
+  the hand approach its margin at up to `(d − ε)/H` and pushes it out at
+  `(ε − d)/H`: a first-order margin servo with gain `1/H`. That gain must
+  be slow next to the closed loop below it. Measured on the simulated FR3,
+  a commanded joint velocity is followed about 40 ms later (plan period and
+  plan time, the command filter, the PD on the integrated reference). With
+  `H = 0.05` s a hand resting on its object margin overshot it by 5 mm and
+  bounced at 3–4 Hz (wrist velocity ±0.2 rad/s), visible as a shaking hand
+  whenever a reach stalls or hovers next to the object. With `H = 0.10` s
+  the same state settles within 1 mm of the margin with no oscillation, and
+  reaches away from any margin are unchanged (same lift times to 0.1 s).
 * `1e-3 |z|²`: with `α = β = 0` near the target the cost constrains six of
   the eight velocities (two fingertips × 3); the regulariser picks the
   smallest motion for the rest.
@@ -209,7 +221,7 @@ object is lifted."
 | Selection weight `w` (eq. 12) | 0.05 m/rad |
 | `K` (eq. 2) | 1 /s |
 | `η_g, T_g, η_h, T_h, δ_gr, v_gr` | 0.15 rad, 0.05, 6 cm, 2 cm, 2 cm, 0.1 m/s |
-| `H`, margins | 0.05 s; object 1 cm (paper), obstacles 5 cm in eq. (3) (paper), 2 cm in eq. (11) |
+| `H`, margins | 0.10 s (above the ~40 ms closed-loop latency, see eq. 11); object 1 cm (paper), obstacles 5 cm in eq. (3) (paper), 2 cm in eq. (11) |
 | Start poses "left-bottom, center-up, right-bottom" | `hrg/study.py`: the ready pose, and the gripper pointing down 27 cm to either side with the fingertips at rim height |
 | GPU nearest-neighbour / via search | CPU (KD-tree, NumPy); plans take 7–15 ms |
 
@@ -220,8 +232,9 @@ object is lifted."
   FR3 this shows when an object lies on its side close to the base: the
   elbow (joint 4) reaches its limit and link 6 its self-collision margin to
   link 1 while the hand spheres rest on their 1 cm object margin, and the
-  reach stops 1–2 cm short (3 of 150 rotated trials, 1 of 6 disturbance
-  trials after a push knocked the mug over; `docs/results.md`). Every plan
+  reach stops 1–2 cm short (5 of 150 rotated trials, one of them with the
+  finger bodies rather than a joint limit at their margin;
+  `docs/results.md`). Every plan
   reports what binds (`ReachStep.info['binding']`, in the controller's log);
   `scripts/dissect.py` replays a recorded trial to the same answer.
 * **Thin rims.** A 1 mm wine-glass rim pinched with one pad near the 1 cm

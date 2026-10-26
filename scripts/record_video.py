@@ -1,10 +1,12 @@
 """Videos of the method at work (sim trials, or whatever is on the LCM bus).
 
 Runs a trial like ``scripts/eval_sim.py`` (sim env + controller headless,
-``v`` pressed after 1 s) and renders the LCM state with ``hrg.render``: the
-robot, the object, the obstacles, the planned fingertip paths (eq. 3), the
-fingertips and their targets (eq. 12), a close-up on the object, and a
-caption (field, time, controller state, fingertip error, perturbations).
+``v`` pressed after 1 s), samples the LCM state at 30 Hz while it runs and,
+once it is over, renders the samples with ``hrg.render``: the robot, the
+object, the obstacles, the planned fingertip paths (eq. 3), the fingertips
+and their targets (eq. 12), a close-up on the object, and a caption (field,
+time, controller state, fingertip error, perturbations). Rendering after the
+trial keeps the CPU to the real-time simulation and the frame timing exact.
 
     # path field vs the eq. (2) baseline from the same start, side by side
     python scripts/record_video.py --object blue_mug --pose left_bottom --seed 1 --fields path linear
@@ -88,8 +90,8 @@ def _text(img, s, org, scale=0.7, color=WHITE, thick=2):
     cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
 
 
-def _fingertip_overlay(lst):
-    ft, P = lst.last.get("franka_hrg_fingertips"), lst.last.get("franka_hrg_paths")
+def _fingertip_overlay(last: dict):
+    ft, P = last.get("franka_hrg_fingertips"), last.get("franka_hrg_paths")
     x = x_tgt = paths = None
     if ft is not None:
         p = {n: np.asarray(v) for n, v in zip(ft.name_list, ft.vec_list)}
@@ -110,14 +112,15 @@ class Recorder:
         self.title, self.subtitle = title, subtitle
         self.reach_visible = False
 
-    def frame(self, lst, t: float, state: str, events: list[str]) -> np.ndarray:
-        m, gs = lst.last.get("franka_arm_joint_meas"), lst.last.get("franka_gripper_state")
-        pose, obs = lst.last.get("franka_object_pose"), lst.last.get("franka_obstacles")
+    def frame(self, last: dict, t: float, state: str, events: list[str]) -> np.ndarray:
+        """One frame from ``last`` (the latest message per channel at that instant)."""
+        m, gs = last.get("franka_arm_joint_meas"), last.get("franka_gripper_state")
+        pose, obs = last.get("franka_object_pose"), last.get("franka_obstacles")
         self.r.set_state(q_arm=None if m is None else m.q, width=None if gs is None else gs.width,
                          obj_pos=None if pose is None else pose.position,
                          obj_quat_wxyz=None if pose is None else pose.quat_wxyz,
                          obstacle_rows=None if obs is None or not obs.num_vecs else obs.vec_list)
-        x, x_tgt, paths = _fingertip_overlay(lst) if state == "reach" else (None, None, None)
+        x, x_tgt, paths = _fingertip_overlay(last) if state == "reach" else (None, None, None)
         img = self.r.render(x, x_tgt, paths).copy()
         close = self.r.render(x, x_tgt, paths, closeup=True)
         iw, ih = int(self.w * 0.42), int(self.h * 0.42)
@@ -146,16 +149,46 @@ def _state(log: str) -> str:
     return m[-1] if m else "idle"
 
 
+class Sampler:
+    """Snapshots of the bus taken at ``FPS`` while the trial runs (cheap:
+    references to the latest decoded messages), rendered afterwards on an
+    exact time grid. Rendering during the trial would compete with the
+    real-time simulation for the CPU and, whenever a frame took longer than
+    1 / FPS, leave the video uneven (frames written at a fixed rate but
+    sampled at irregular wall-clock times)."""
+
+    def __init__(self):
+        self.samples: list[tuple[float, dict, float, str, list[str]]] = []  # (wall time, last, t, state, events)
+
+    def take(self, t_wall: float, lst, t: float, state: str, events: list[str]) -> None:
+        self.samples.append((t_wall, dict(lst.last), t, state, list(events)))
+
+    def render(self, rec: Recorder, writer: FFmpegWriter) -> None:
+        """Every frame of the uniform grid shows the latest sample at or
+        before its time (the sim state is held, never interpolated)."""
+        if not self.samples:
+            return
+        gaps = np.diff([s[0] for s in self.samples])
+        if gaps.size and gaps.max() > 3.0 / FPS:
+            print(f"  note: sampling fell behind by up to {gaps.max():.2f} s (CPU contention)")
+        t_last, k = self.samples[-1][0], 0
+        for n in range(int(t_last * FPS) + 1):
+            tf = n / FPS
+            while k + 1 < len(self.samples) and self.samples[k + 1][0] <= tf:
+                k += 1
+            _, last, t, state, events = self.samples[k]
+            writer.write(rec.frame(last, t, state, events))
+
+
 def record_trial(path: str, obj: str, pose: str, seed: int, field: str, orientation: str, env_cfgs,
                  push_at, jump_at, duration: float, width: int, height: int, title: str) -> dict:
     env_cfg = OmegaConf.merge(*[OmegaConf.load(resolve(f)) for f in env_cfgs])
     halves = [o["half"] for o in (env_cfg.get("obstacles") or [])]
     sub = (f"{obj}, gripper start {pose.replace('_', '-')}, {orientation}, placement {seed}"
            "   |   FR3 + Robotiq 2F-85, MuJoCo, real time")
-    rec = Recorder(f"configs/objects/{obj}.yaml", halves, width, height, title, sub)
     out_dir = tempfile.mkdtemp(prefix="hrg_video_")
-    writer = FFmpegWriter(path, width, height)
     info = dict(lifted=False)
+    sampler = Sampler()
     with Listener(CHANNELS) as lst, Procs(out_dir) as procs:
         env = procs.start("env", "run_env.py", "--config", *env_cfgs, "--vis_mode", "vis_off",
                           "--object_config", f"configs/objects/{obj}.yaml", "--obj_spawn_seed", str(seed),
@@ -194,26 +227,33 @@ def record_trial(path: str, obj: str, pose: str, seed: int, field: str, orientat
             if t_end is None and (state == "hold" or (t_v is not None and t >= duration)):
                 t_end = now + 2.0
             events = [e for te, e in shown if 0.0 <= t - te < 1.2]
-            writer.write(rec.frame(lst, t, state, events))
+            sampler.take(now - t_start, lst, t, state, events)
             n += 1
             if t_end is not None and now >= t_end:
                 break
         info["log"] = log
-    writer.close()
     shutil.rmtree(out_dir, ignore_errors=True)
+    # the trial is over: render the samples with the machine to ourselves
+    rec = Recorder(f"configs/objects/{obj}.yaml", halves, width, height, title, sub)
+    writer = FFmpegWriter(path, width, height)
+    sampler.render(rec, writer)
+    writer.close()
     return info
 
 
 def record_live(path: str, obj: str, duration: float, width: int, height: int, title: str) -> None:
-    rec = Recorder(f"configs/objects/{obj}.yaml", [], width, height, title, "live from the LCM bus")
-    writer = FFmpegWriter(path, width, height)
+    sampler = Sampler()
     with Listener(CHANNELS) as lst:
         t0 = time.time()
         n = 0
         while time.time() - t0 < duration:
             lst.spin(max(0.0, t0 + n / FPS - time.time()))
-            writer.write(rec.frame(lst, time.time() - t0, "reach" if "franka_hrg_paths" in lst.last else "-", []))
+            t = time.time() - t0
+            sampler.take(t, lst, t, "reach" if "franka_hrg_paths" in lst.last else "-", [])
             n += 1
+    rec = Recorder(f"configs/objects/{obj}.yaml", [], width, height, title, "live from the LCM bus")
+    writer = FFmpegWriter(path, width, height)
+    sampler.render(rec, writer)
     writer.close()
 
 

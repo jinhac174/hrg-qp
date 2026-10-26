@@ -103,7 +103,7 @@ class HRGParams:
     eta_h: float = 0.06
     T_h: float = 0.02
     # eq. (11)
-    horizon: float = 0.05
+    horizon: float = 0.10  # above the closed-loop latency, docs/method.md eq. (11)
     qp_reg: float = 1e-3
     qp_eps_obj: float = 0.01
     qp_eps_obs: float = 0.02

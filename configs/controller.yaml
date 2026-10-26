@@ -40,7 +40,7 @@ hrg:
   eta_h: 0.06              # m: below this fingertip error the posture field fades out
   T_h: 0.02
   # eq. (11): QP
-  horizon: 0.05            # s, H
+  horizon: 0.10            # s, H: must exceed the closed-loop latency (~40 ms command -> joint velocity), see docs/method.md
   qp_reg: 0.001            # z^T z regulariser (the cost has rank 6 of 8 once alpha, beta -> 0)
   qp_eps_obj: 0.01         # m, hand spheres vs target object
   qp_eps_obs: 0.02         # m, hand spheres vs obstacles
