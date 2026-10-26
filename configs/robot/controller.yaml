@@ -4,6 +4,10 @@
 env_mode: real
 grasp:
   grasp_trigger_dist: 0.015   # paper: 1.5 cm on the robot (pose estimation noise)
+  # The tabletop is ~1.2 cm above the robot's mounting surface (base z = 0):
+  # the calibrated camera puts the AprilTag on it at z = 1.1 cm and a bowl's
+  # base at 1.3 cm (2026-10-26), and it looks slightly higher by eye.
+  table_z: 0.012
 # Gamma(q): the real cell's (virtual) floor and walls, published by
 # run_hardware.py from assets/robot/scene_real_cell.xml.
 col_pairs:

@@ -4,7 +4,10 @@
 name: foundation_pose_tracking_sam2
 
 object_name: "predefined_obj"
-mesh_file: assets/objects/blue_bowl/visual.obj   # the object's visual.obj (its frame = the targets' frame)
+# The object's mesh in the object frame (= the fingertip targets' frame):
+# visual_textured.obj where the scan has a texture (FoundationPose matches colour
+# too: bowl, mug, plate), else visual.obj (wine glass, red cup, tape).
+mesh_file: assets/objects/blue_bowl/visual_textured.obj
 
 est_refine_iter: 1
 track_refine_iter: 2

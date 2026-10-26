@@ -1,6 +1,6 @@
 # run_pose_bridge.py: FoundationPose -> the controller's object pose.
 fp_pose_channel: fp_obj_pose                     # what run_perception.py publishes
-mesh_file: assets/objects/blue_bowl/visual.obj   # the SAME mesh FoundationPose loads
+mesh_file: assets/objects/blue_bowl/visual_textured.obj   # the SAME mesh FoundationPose loads
 object_pose_channel: franka_object_pose          # what the controller subscribes to
 # Camera extrinsics give poses in a "world" frame; if they are calibrated
 # against the robot base, world = base and this stays identity.

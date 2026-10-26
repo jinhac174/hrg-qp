@@ -125,6 +125,12 @@ class FoundationPoseTrackingSAM2(BasePerception):
             debug=self._debug,
             glctx=self._glctx,
         )
+        # The diameter is a numpy float64. FoundationPose builds its crop-window
+        # offsets with torch.tensor([..., radius, ...]), and current torch takes
+        # float64 from a numpy scalar there (it used to give the float32 default):
+        # register() then fails in compute_crop_window_tf_batch with
+        # "float != double" (K is float32). A Python float keeps it float32.
+        self._estimator.diameter = float(self._estimator.diameter)
         self._estimator.make_rotation_grid(
             min_n_views=self._register_min_n_views,
             inplane_step=self._register_inplane_step,

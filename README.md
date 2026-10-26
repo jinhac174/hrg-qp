@@ -35,10 +35,11 @@ hrg/                   the method and its runtime
 fr3/                   the FR3 stack this runs on (from franka_visual_servoing, pruned):
                        LCM types / pub-sub, MuJoCo base envs, the FR3 sim platform and the
                        real hardware process (libfranka + Robotiq + safety layer), ZED and
-                       FoundationPose wrappers
+                       FoundationPose wrappers, the camera calibration (utils/calibration)
 run_env.py             simulation              run_hardware.py    the real robot
 run_controller.py      the controller          run_visualizer.py  browser 3-D view
 run_sensors.py, run_perception.py, run_pose_bridge.py   cameras -> FoundationPose -> object pose
+run_grav_comp.py, run_camera_calibration.py             move the arm by hand; base -> camera extrinsic
 configs/               controller.yaml (the method's parameters), sim/, robot/, objects/, visualizer.yaml
 assets/robot/          FR3 + 2F-85 MJCF / URDF / meshes;  assets/objects/<name>/: scans, meshes, targets
 scripts/               prepare_objects.py, eval_sim.py, rollout.py, dissect.py, plot_trace.py, record_video.py, sim.sh

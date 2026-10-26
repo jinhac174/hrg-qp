@@ -1,0 +1,55 @@
+# Base -> camera calibration of the fixed ZED (ext1), run_camera_calibration.py.
+# Processes: run_hardware.py, run_sensors.py (zed.yaml), run_grav_comp.py (move
+# the arm by hand), and this. Result: the tf_link_to_cam block for zed.yaml.
+# For the second camera: a copy with rgbd_channel: zed_ext2.
+
+rgbd_channel: zed_ext1
+arm_joint_meas_channel: franka_arm_joint_meas
+hand_joint_meas_channel: franka_gripper_joint_meas   # Robotiq driver angle (run_hardware.py)
+
+num_joints: 8              # fr3_robotiq.urdf: 7 arm joints + the gripper's driver joint
+num_arm_joints: 7
+num_hand_joints: 1
+
+ground_truth: false        # real camera: the extrinsic in zed.yaml is only the configured value
+
+num_captures: 8            # arm poses; the last num_holdout are not fitted, only evaluated
+num_holdout: 2
+
+urdf_path: assets/robot/urdf/fr3_robotiq.urdf   # with the 2F-85's moving linkage (rendered)
+max_faces: 0
+arm_only: false            # render the gripper too (click it in the SAM2 masks)
+
+# apriltag = start from the tag on the desk; config = start from zed.yaml's current
+# extrinsic (re-calibrating after a small bump).
+init: apriltag
+apriltag:
+  family: tag36h11
+  id: 0
+  size: 0.148              # measured edge of the printed BLACK square (m)
+  # Where the tag lies, in the robot base frame: origin at the centre of the
+  # base on its mounting surface, x forward (away from the base's connectors),
+  # y left, z up. yaw_deg = angle of the tag's x axis (to the right as you read
+  # it) from base x, counter-clockwise; z = desk height above the mounting surface.
+  # x / y / yaw of the 2026-10-19 and 10-26 calibrations: re-measure if moved. z: the
+  # desk is ~1.2 cm above the mounting surface (configs/robot/controller.yaml, table_z).
+  tag_in_base:
+    position: [0.363, 0.0, 0.012]
+    yaw_deg: 90.0          # tag x axis = base +y: reads upright standing in front of the robot, facing it
+
+# boundary_then_area: the boundary loss pulls the outline in from afar, the area
+# loss then finishes without being dragged by mask mistakes (tutorial 14 sec. 3).
+loss: boundary_then_area
+boundary_clip_px: 0
+lr: 0.003
+lr_final: 0.0001
+n_iters: 1500
+early_stop: 200
+viz_every: 5
+render_gray: 0.7
+
+output_dir: outputs/calibration
+
+sam2_hf_repo: facebook/sam2.1-hiera-tiny
+sam2_hf_filename: sam2.1_hiera_tiny.pt
+sam2_config_file: configs/sam2.1/sam2.1_hiera_t.yaml

@@ -82,3 +82,21 @@ def test_hardware_and_controller_in_real_mode(procs):
             assert "QP failed" not in log and "No reachable" not in log
         finally:
             stop.set()
+
+
+def test_grav_comp_floats_the_arm(procs):
+    """run_grav_comp.py (hand-guiding for the camera calibration) on the fake
+    FR3: the safety layer accepts its gravity, and the arm floats in place."""
+    with Listener(CHANNELS) as lst:
+        hw = procs.start("hw", *HW)
+        assert lst.wait_for(lambda: "franka_arm_joint_meas" in lst.last, STARTUP), "hardware did not publish"
+        gc = procs.start("grav_comp", "run_grav_comp.py", "--config", "configs/robot/grav_comp.yaml")
+        assert lst.wait_for(lambda: lst.count["franka_arm_joint_ctrl"] > 500, STARTUP), gc.log()[-2000:]
+        lst.reset_counts()
+        lst.spin(2.0)
+        assert lst.count["franka_arm_joint_ctrl"] / 2.0 > 500
+        cmd = lst.last["franka_arm_joint_ctrl"]
+        assert not np.any(cmd.kp) and not np.any(cmd.kd)  # torque only: free to move by hand
+        assert np.max(np.abs(np.asarray(lst.last["franka_arm_joint_meas"].q) - HOME_Q)) < 0.02
+        log = hw.log()
+        assert "Controller sends gravity: following it." in log and "REFUSED" not in log, log[-2000:]

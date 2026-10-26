@@ -1,0 +1,14 @@
+# Gravity compensation on the real FR3 (run_grav_comp.py): move the arm by hand,
+# e.g. for the camera calibration (run_camera_calibration.py).
+ctrl_freq: 1000
+env_mode: real
+# The model run_hardware.py holds the arm with (gravity_urdf in hardware.yaml).
+urdf_path: assets/robot/urdf/fr3_robotiq_rigid.urdf
+arm_damping: 0.5           # Nm per rad/s: light, keeps the floating arm from drifting
+
+sub_manager:
+  arm_joint_meas_channel: franka_arm_joint_meas
+  max_sub_freq: 2000
+pub_manager:
+  ctrl_channel: franka_arm_joint_ctrl
+  max_pub_freq: 2000
