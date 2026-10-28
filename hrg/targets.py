@@ -10,9 +10,10 @@ Generation (object frame, upright)
 1. Contact pairs ``(p1, p2)`` from two sources:
 
    * rim pinches, as T2SQNet places them on tableware (paper Fig. 4): at a
-     few depths below the top, horizontal rays toward the vertical axis; the
-     outer and the inner skin they cross form a pair (a mug's handle gives
-     handle pinches the same way);
+     few depths below the top, horizontal rays toward the vertical axis find
+     the outer skin; from there a ray along the wall's inward normal finds the
+     inner skin, so the pair is antipodal on a slanted wall too (a mug's
+     handle gives handle pinches the same way);
    * antipodal pairs anywhere on the surface (``sample_antipodal_grasps``).
 2. Pre-grasp fingertip targets: each pad backs off ``offset`` along the pair
    axis, ``x1 = p1 - offset a``, ``x2 = p2 + offset a`` (``a = (p2 - p1)/|.|``),
@@ -20,33 +21,49 @@ Generation (object frame, upright)
    The targets themselves must satisfy the path constraint of eq. (3),
    ``d(x*, O) >= eps_O``: they are the paths' end points.
 3. Approach directions: the hand may be turned about the pair axis; for each
-   of ``num_approach`` such directions the open hand at the pre-grasp must be
-   admissible under the QP's constraints (eq. 11): every hand sphere
+   of ``num_approach`` such directions (the TCP ``z``, ``approach_dirs``) the
+   open hand must be admissible under the QP's constraints (eq. 11) at the
+   pre-grasp *and* swept back along the approach over ``approach_dist`` (the
+   straight final approach, ``fields.FingertipPathField``): every hand sphere
    (``hand.hand_spheres_local``) at least ``qp_eps_obj`` from the object (with
    the object's own distance function, the one the QP uses), and the gripper
    boxes clear of the actual mesh (what the simulation collides with). A pair
    with no such direction is dropped. The admissible directions are stored
-   with their sphere centres (object frame).
-4. Thin the set out (farthest-point sampling on the pair centres).
+   with their sphere centres at the pre-grasp (object frame).
+4. Of pairs at the same place (centres within 3 mm, axes within 30 deg; a
+   rim hit's horizontal and normal pinch) keep the one closest to antipodal
+   (``misalign``, the pair axis vs the surface normals), then thin the set
+   out (farthest-point sampling on the pair centres).
 
 Validity online
 ---------------
-The table depends on how the object lies: a pair is valid if one of its
-admissible directions keeps every hand sphere ``qp_eps_table`` above the table
-at the current object pose (``FingertipTargets.valid``).
+The table depends on how the object lies: a direction is usable if every
+hand sphere stays ``qp_eps_table`` above the table at the pre-grasp and at
+the far end of the approach (``FingertipTargets.usable``); a pair is valid if
+one of its admissible directions is usable.
 
-Selection (eq. 12): the valid pair (either finger order) minimising
-``|x1 - x1*| + |x2 - x2*| + w * angle(x2 - x1, x2* - x1*)``.
+Hand orientation (the oriented reach)
+-------------------------------------
+Each direction gives the pair a hand orientation in the object frame,
+``R_grasp = [y x z, y, z]`` with ``y = a`` (fingertip 1 on ``x1``) and ``z``
+the approach (``grasp_rotations``); online ``R* = R_obj R_grasp``, and the
+other finger order is ``R* Rz(pi)``. Which (pair, direction, order) to take
+is decided in joint space by the planner (``ReachPlanner._select_oriented``).
+
+Selection (eq. 12, the paper's reach): the valid pair (either finger order)
+minimising ``|x1 - x1*| + |x2 - x2*| + w * angle(x2 - x1, x2* - x1*)``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import trimesh
 
 from hrg.hand import MAX_WIDTH, HandCollisionChecker, hand_spheres_local, pad_dz
+
+SWAP = np.diag([-1.0, -1.0, 1.0])  # R* -> the other finger order (Rz(pi))
 
 
 @dataclass
@@ -62,6 +79,15 @@ class FingertipTargets:
     approach_ok: np.ndarray | None = None
     spheres: np.ndarray | None = None
     sphere_r: np.ndarray | None = None
+    # TCP z of each approach direction (N, K, 3), object frame. Older files
+    # lack it: recomputed from the pair axes.
+    approach_dirs: np.ndarray | None = None
+    # (N,) how far the pair axis is from the surface normals at p1 / p2 (rad,
+    # the worse of the two): 0 = antipodal, the pads flat on the surface.
+    misalign: np.ndarray | None = None
+    # Preferred approach (TCP z) in the object frame: the object config's
+    # ``approach_axis``; from above by default.
+    approach_axis: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0, -1.0]))
 
     def __len__(self) -> int:
         return len(self.x1)
@@ -71,30 +97,68 @@ class FingertipTargets:
         return np.linalg.norm(self.p2 - self.p1, axis=1)
 
     def save(self, path: str) -> None:
-        np.savez(path, x1=self.x1, x2=self.x2, p1=self.p1, p2=self.p2,
-                 approach_ok=self.approach_ok, spheres=self.spheres, sphere_r=self.sphere_r)
+        arrays = dict(x1=self.x1, x2=self.x2, p1=self.p1, p2=self.p2, approach_ok=self.approach_ok,
+                      spheres=self.spheres, sphere_r=self.sphere_r, approach_dirs=self.dirs(),
+                      misalign=self.misalign)
+        np.savez(path, **{k: v for k, v in arrays.items() if v is not None})
 
     @classmethod
-    def load(cls, path: str) -> "FingertipTargets":
+    def load(cls, path: str, approach_axis=None) -> "FingertipTargets":
         d = np.load(path)
-        extra = {k: d[k] for k in ("approach_ok", "spheres", "sphere_r") if k in d.files}
-        return cls(d["x1"], d["x2"], d["p1"], d["p2"], **extra)
+        extra = {k: d[k] for k in ("approach_ok", "spheres", "sphere_r", "approach_dirs", "misalign") if k in d.files}
+        tg = cls(d["x1"], d["x2"], d["p1"], d["p2"], **extra)
+        if approach_axis is not None:
+            a = np.asarray(approach_axis, dtype=float)
+            tg.approach_axis = a / np.linalg.norm(a)
+        return tg
 
     def transformed(self, T: np.ndarray) -> "FingertipTargets":
         """The target points in the world (the approach data stays object frame)."""
         R, p = T[:3, :3], T[:3, 3]
         f = lambda X: X @ R.T + p  # noqa: E731
         return FingertipTargets(f(self.x1), f(self.x2), f(self.p1), f(self.p2),
-                                self.approach_ok, self.spheres, self.sphere_r)
+                                self.approach_ok, self.spheres, self.sphere_r,
+                                self.dirs(), self.misalign, self.approach_axis)
 
-    def valid(self, T_obj: np.ndarray, table_z: float, eps_table: float) -> np.ndarray:
-        """(N,) pairs with an admissible approach whose hand spheres all stay
-        ``eps_table`` above the table with the object at ``T_obj``."""
+    # ------------------------------------------------------------ approach directions
+    def dirs(self) -> np.ndarray | None:
+        """(N, K, 3) approach directions, object frame."""
+        if self.approach_dirs is None and self.approach_ok is not None:
+            a = self.p2 - self.p1
+            a /= np.linalg.norm(a, axis=1, keepdims=True)
+            k = self.approach_ok.shape[1]
+            self.approach_dirs = np.stack([_approach_dirs(ai, k) for ai in a]) if len(a) else np.zeros((0, k, 3))
+        return self.approach_dirs
+
+    def usable(self, T_obj: np.ndarray, table_z: float, eps_table: float, approach_dist: float = 0.0) -> np.ndarray:
+        """(N, K) admissible directions whose hand spheres all stay
+        ``eps_table`` above the table with the object at ``T_obj``, at the
+        pre-grasp and ``approach_dist`` back along the approach (the sweep
+        is a translation: its lowest point is at one of the two ends)."""
         if self.spheres is None:
-            return np.ones(len(self), dtype=bool)
-        z = np.einsum("j,nksj->nks", T_obj[2, :3], self.spheres) + T_obj[2, 3]
+            return np.ones((len(self), 1), dtype=bool)
+        up = T_obj[2, :3]
+        z = np.einsum("j,nksj->nks", up, self.spheres) + T_obj[2, 3]
         clear = np.min(z - self.sphere_r, axis=2) >= table_z + eps_table  # (N, K)
-        return np.any(clear & self.approach_ok, axis=1)
+        if approach_dist > 0.0 and self.dirs() is not None:
+            back = z - approach_dist * np.einsum("j,nkj->nk", up, self.dirs())[:, :, None]
+            clear &= np.min(back - self.sphere_r, axis=2) >= table_z + eps_table
+        return clear & self.approach_ok
+
+    def valid(self, T_obj: np.ndarray, table_z: float, eps_table: float, approach_dist: float = 0.0) -> np.ndarray:
+        """(N,) pairs with a usable approach direction (``usable``)."""
+        return np.any(self.usable(T_obj, table_z, eps_table, approach_dist), axis=1)
+
+    def grasp_rotations(self, T_obj: np.ndarray, j: np.ndarray, k: np.ndarray) -> np.ndarray:
+        """(M, 3, 3) world hand orientations ``R_obj R_grasp`` of pairs ``j``
+        approached along their directions ``k`` (fingertip 1 on ``x1``)."""
+        a = self.p2[j] - self.p1[j]
+        a /= np.linalg.norm(a, axis=1, keepdims=True)
+        z = self.dirs()[j, k]
+        z = z - np.sum(z * a, axis=1, keepdims=True) * a  # exactly perpendicular
+        z /= np.linalg.norm(z, axis=1, keepdims=True)
+        R = np.stack([np.cross(a, z), a, z], axis=2)  # columns x, y, z
+        return np.einsum("ij,njk->nik", T_obj[:3, :3], R)
 
 
 # ---------------------------------------------------------------- contact pairs
@@ -174,32 +238,68 @@ def sample_antipodal_grasps(
 
 def rim_pinch_pairs(mesh: trimesh.Trimesh, depths=(0.008, 0.015, 0.025), n_azimuth: int = 72,
                     max_width: float = 0.05):
-    """Horizontal pinches across the wall below the top of an upright object:
-    ``(p1 (N, 3) outer, p2 (N, 3) inner)``. The object is centred in x / y."""
+    """Pinches across the wall below the top of an upright object:
+    ``(p1 (N, 3) outer, p2 (N, 3) inner)``. The object is centred in x / y.
+
+    A horizontal ray toward the axis finds the outer skin ``p1``. Two pairs
+    per hit: the horizontal ray's own exit (T2SQNet's pinch), and where a ray
+    from ``p1`` along the wall's inward normal leaves the wall, antipodal on
+    a slanted wall (22 deg on the gold bowl), when it differs. Which of them
+    the hand can approach depends on the wall: along a straight slanted wall
+    only the normal one sweeps clear, on a curved one (the wine glass) the
+    tilted hand meets the curve and the horizontal one remains (the
+    admissibility check in ``generate_fingertip_targets`` decides). Where the
+    outer normal is nearly vertical (a flat top) only the horizontal one."""
     top = float(mesh.bounds[1][2])
     R = float(np.linalg.norm(mesh.bounds[1][:2] - mesh.bounds[0][:2])) + 0.05
     th = 2.0 * np.pi * np.arange(n_azimuth) / n_azimuth
     dirs_xy = np.column_stack([np.cos(th), np.sin(th), np.zeros_like(th)])
-    P1, P2 = [], []
+    P1, N1, P2_ray = [], [], []
     for depth in depths:
         z = top - depth
         origins = dirs_xy * R + np.array([0.0, 0.0, z])
-        locs, ray_idx, _ = mesh.ray.intersects_location(origins, -dirs_xy, multiple_hits=True)
+        locs, ray_idx, tri_idx = mesh.ray.intersects_location(origins, -dirs_xy, multiple_hits=True)
         for r in range(n_azimuth):
-            hits = locs[ray_idx == r]
+            sel = ray_idx == r
+            hits, tris = locs[sel], tri_idx[sel]
             if len(hits) < 2:
                 continue
-            hits = hits[np.argsort(np.linalg.norm(hits - origins[r], axis=1))]
+            order = np.argsort(np.linalg.norm(hits - origins[r], axis=1))
+            hits, tris = hits[order], tris[order]
             # first entry / exit, skipping duplicate hits on the same skin
             p1 = hits[0]
             rest = hits[np.linalg.norm(hits - p1, axis=1) > 1e-3]
             if len(rest) == 0:
                 continue
-            p2 = rest[0]
-            if np.linalg.norm(p2 - p1) <= max_width:
-                P1.append(p1)
-                P2.append(p2)
-    return np.asarray(P1).reshape(-1, 3), np.asarray(P2).reshape(-1, 3)
+            n1 = mesh.face_normals[tris[0]]
+            if n1 @ dirs_xy[r] < 0.0:  # outward = toward where the ray came from
+                n1 = -n1
+            P1.append(p1)
+            N1.append(n1)
+            P2_ray.append(rest[0])
+    if not P1:
+        return np.zeros((0, 3)), np.zeros((0, 3))
+    P1, N1, P2_ray = np.asarray(P1), np.asarray(N1), np.asarray(P2_ray)
+
+    # Along the inward normal: the nearest exit beyond the start, just inside p1.
+    out1, out2 = [P1], [P2_ray]
+    idx = np.flatnonzero(np.abs(N1[:, 2]) < 0.7)
+    if len(idx):
+        locs, ray_idx, _ = mesh.ray.intersects_location(P1[idx] - 1e-4 * N1[idx], -N1[idx], multiple_hits=True)
+        for i, r in enumerate(idx):
+            hits = locs[ray_idx == i]
+            d = np.linalg.norm(hits - P1[r], axis=1)
+            d = d[d > 3e-4]
+            if not len(d):
+                continue
+            p2 = P1[r] - d.min() * N1[r]
+            a_ray = (P2_ray[r] - P1[r]) / np.linalg.norm(P2_ray[r] - P1[r])
+            if a_ray @ -N1[r] < np.cos(np.radians(5.0)):  # a different pair
+                out1.append(P1[r:r + 1])
+                out2.append(p2[None])
+    P1, P2 = np.vstack(out1), np.vstack(out2)
+    keep = np.linalg.norm(P2 - P1, axis=1) <= max_width
+    return P1[keep], P2[keep]
 
 
 # ---------------------------------------------------------------- generation
@@ -227,16 +327,20 @@ def generate_fingertip_targets(
     eps_path: float = 0.01,
     qp_eps_obj: float = 0.01,
     num_samples: int = 4000,
-    num_approach: int = 12,
+    num_approach: int = 24,
     max_targets: int = 150,
     min_width: float = 0.002,
     mu: float = 0.8,
     box_margin: float = 0.003,
     rim_depths=(0.008, 0.015, 0.025),
+    approach_dist: float = 0.10,
+    sweep_steps: int = 4,
     seed: int = 0,
 ) -> FingertipTargets:
     """See the module docstring. ``sdf``: the object's distance function in
-    its own frame (identity pose), the same one the controller uses."""
+    its own frame (identity pose), the same one the controller uses.
+    ``approach_dist``: the straight final approach checked behind each
+    pre-grasp (``hrg.approach_dist``), in ``sweep_steps`` steps."""
     max_contact = MAX_WIDTH - 2.0 * offset - 0.003
     pairs = sample_antipodal_grasps(mesh, num_samples=num_samples, mu=mu, max_width=max_contact,
                                     min_width=min_width, seed=seed)
@@ -246,6 +350,7 @@ def generate_fingertip_targets(
     P1 = np.vstack([rp1, pairs.p1]) if len(pairs) else rp1
     P2 = np.vstack([rp2, pairs.p2]) if len(pairs) else rp2
     chk = HandCollisionChecker(mesh)
+    steps = np.linspace(0.0, approach_dist, max(int(sweep_steps), 1) + 1) if approach_dist > 0 else np.zeros(1)
 
     keep = []
     for p1, p2 in zip(P1, P2):
@@ -260,21 +365,38 @@ def generate_fingertip_targets(
         S_loc, _, r, _ = hand_spheres_local(open_w)
         c = 0.5 * (p1 + p2)
         ok, centres = [], []
-        for z in _approach_dirs(a, num_approach):
+        dirs = _approach_dirs(a, num_approach)
+        for z in dirs:
             T = _hand_pose(c, a, z, open_w)
             C = S_loc @ T[:3, :3].T + T[:3, 3]
             centres.append(C)
-            ok.append(
-                bool(np.min(sdf.dist(C) - r) >= qp_eps_obj)
-                and not chk.collides(T, open_w, margin=box_margin)
-            )
+            good = True
+            for back in steps:  # the hand swept back along the approach
+                Ts = T.copy()
+                Ts[:3, 3] -= back * z
+                if (np.min(sdf.dist(C - back * z) - r) < qp_eps_obj
+                        or chk.collides(Ts, open_w, margin=box_margin)):
+                    good = False
+                    break
+            ok.append(good)
         if any(ok):
-            keep.append((x1, x2, p1, p2, np.asarray(ok), np.asarray(centres), r))
+            keep.append((x1, x2, p1, p2, np.asarray(ok), np.asarray(centres), r, dirs))
 
     if not keep:
         e = np.zeros((0, 3))
         return FingertipTargets(e, e, e, e)
-    x1, x2, p1, p2, ok, centres, radii = (np.asarray(v) for v in zip(*keep))
+    x1, x2, p1, p2, ok, centres, radii, dirs = (np.asarray(v) for v in zip(*keep))
+    mis = pair_misalignment(mesh, p1, p2)
+    # Same place, similar axis: the most antipodal one.
+    a = (p2 - p1) / np.linalg.norm(p2 - p1, axis=1, keepdims=True)
+    mid = 0.5 * (p1 + p2)
+    kept: list[int] = []
+    for i in np.argsort(mis, kind="stable"):
+        if not any(np.linalg.norm(mid[i] - mid[k]) < 0.003 and abs(a[i] @ a[k]) > np.cos(np.radians(30.0))
+                   for k in kept):
+            kept.append(i)
+    kept = np.sort(np.asarray(kept))
+    x1, x2, p1, p2, ok, centres, dirs, mis = (v[kept] for v in (x1, x2, p1, p2, ok, centres, dirs, mis))
 
     # Farthest-point thinning on the pair centres (starting from the first).
     sel = np.arange(len(x1))
@@ -287,7 +409,23 @@ def generate_fingertip_targets(
             idx.append(j)
             dmin = np.minimum(dmin, np.linalg.norm(c - c[j], axis=1))
         sel = np.asarray(idx)
-    return FingertipTargets(x1[sel], x2[sel], p1[sel], p2[sel], ok[sel], centres[sel], radii[0])
+    return FingertipTargets(x1[sel], x2[sel], p1[sel], p2[sel], ok[sel], centres[sel], radii[0], dirs[sel], mis[sel])
+
+
+def pair_misalignment(mesh: trimesh.Trimesh, p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
+    """(N,) the worse angle between a pad's pressing direction and the
+    surface's inward normal at its contact (rad): the pad at ``p1`` presses
+    along ``a = (p2 - p1)/|.|``, the one at ``p2`` along ``-a``."""
+    a = (p2 - p1) / np.maximum(np.linalg.norm(p2 - p1, axis=1, keepdims=True), 1e-12)
+    _, _, f1 = trimesh.proximity.closest_point(mesh, p1)
+    _, _, f2 = trimesh.proximity.closest_point(mesh, p2)
+    n1, n2 = mesh.face_normals[f1], mesh.face_normals[f2]
+    # outward normal at p1 faces away from p2 (and at p2 away from p1), whatever the mesh's winding
+    n1 = np.where(np.sum(n1 * a, axis=1, keepdims=True) > 0, -n1, n1)
+    n2 = np.where(np.sum(n2 * a, axis=1, keepdims=True) < 0, -n2, n2)
+    c1 = np.sum(a * -n1, axis=1)
+    c2 = np.sum(-a * -n2, axis=1)
+    return np.arccos(np.clip(np.minimum(c1, c2), -1.0, 1.0))
 
 
 # ---------------------------------------------------------------- selection (eq. 12)
@@ -323,3 +461,4 @@ def select_target(x: np.ndarray, X1: np.ndarray, X2: np.ndarray, w_angle: float,
         return None, False
     j = int(np.argmin(cost))
     return j, bool(swapped[j])
+

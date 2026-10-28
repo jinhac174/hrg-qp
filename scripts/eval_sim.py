@@ -7,6 +7,9 @@ sim env and the controller headless, press ``v`` and record:
   ``--timeout`` s (paper: "lifts the object within 20 seconds");
 * the fingertip-centre error at the end (Fig. 6), from the controller's
   fingertip channel;
+* after the lift, the object's tilt once the controller holds it
+  (``tilt_end``, deg from upright; the upright phase, ``grasp.upright``) and
+  whether it is still held (``held_end``);
 * time to grasp, time to lift, plan time, robot-obstacle contact (Fig. 8:
   a failure), the rates at which commands / measurements reached this
   process (bus health).
@@ -46,6 +49,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Own LCM bus, so a sim you have open is not disturbed (child processes inherit it).
 os.environ.setdefault("LCM_DEFAULT_URL", f"udpm://239.255.76.67:{random.randint(30000, 39999)}?ttl=0")
+os.environ["HRG_LOG"] = "0"  # every trial keeps its own logs
 
 from fr3.lcm_type.gripper.gripper_state_t import gripper_state_t  # noqa: E402
 from fr3.lcm_type.joint.joint_ctrl_t import joint_ctrl_t  # noqa: E402
@@ -99,10 +103,17 @@ def ctrl_args(obj: str, field: str, extra=()):
             "--hrg.field", field, *extra]
 
 
+def tilt_deg(quat_wxyz) -> float:
+    """Angle between the object's +z and the world's up (deg)."""
+    w, x, y, z = (float(v) for v in quat_wxyz)
+    return float(np.degrees(np.arccos(np.clip(1.0 - 2.0 * (x * x + y * y), -1.0, 1.0))))
+
+
 def run_trial(out: Path, obj: str, pose: str, seed: int, field: str, timeout: float, env_cfgs=(ENV_CFG,),
               push_at=(), jump_at=(), orientation: str = "upright", ctrl_extra=()) -> dict:
     row = dict(object=obj, orientation=orientation, pose=pose, seed=seed, field=field, success=False,
-               t_grasp=np.nan, t_lift=np.nan, ft_err=np.nan, infra=False)
+               t_grasp=np.nan, t_lift=np.nan, ft_err=np.nan, infra=False, tilt_start=np.nan, tilt_end=np.nan,
+               held_end=False)
     with Listener(CHANNELS) as lst, Procs(out) as procs:
         env = procs.start("env", *env_args(env_cfgs, obj, pose, seed, orientation))
         if not lst.wait_for(lambda: "franka_object_pose" in lst.last, 60):
@@ -110,6 +121,7 @@ def run_trial(out: Path, obj: str, pose: str, seed: int, field: str, timeout: fl
             return row
         lst.spin(1.0)
         z0 = float(lst.last["franka_object_pose"].position[2])
+        row["tilt_start"] = tilt_deg(lst.last["franka_object_pose"].quat_wxyz)
         ctrl = procs.start("ctrl", *ctrl_args(obj, field, ctrl_extra))
         if not lst.wait_for(lambda: lst.count["franka_arm_joint_ctrl"] > 500, 90):
             row["note"], row["infra"] = "controller did not start", True
@@ -144,6 +156,14 @@ def run_trial(out: Path, obj: str, pose: str, seed: int, field: str, timeout: fl
             if float(lst.last["franka_object_pose"].position[2]) - z0 > 0.05 and held and not events:
                 row["success"], row["t_lift"] = True, time.time() - t0
                 break
+        if row["success"]:  # until the controller holds it (after the upright phase), then the tilt
+            t1 = time.time()
+            while time.time() - t1 < 15.0 and "Press x to release" not in ctrl.log():
+                lst.spin(0.1)
+            lst.spin(1.0)
+            gs = lst.last.get("franka_gripper_state")
+            row["held_end"] = gs is not None and bool(gs.is_grasped)
+            row["tilt_end"] = tilt_deg(lst.last["franka_object_pose"].quat_wxyz)
         dt = time.time() - t0
         row["ctrl_hz"] = lst.count["franka_arm_joint_ctrl"] / dt
         row["meas_hz"] = lst.count["franka_arm_joint_meas"] / dt
@@ -198,6 +218,7 @@ def main():
                     rows.append(r)
                     print(f"{field:6s} {obj:12s} {ori:7s} {pose:12s} seed {seed}: "
                           f"{'OK ' if r['success'] else 'FAIL'} t_lift={r['t_lift']:.1f}s "
+                          f"tilt {r['tilt_start']:.0f}->{r['tilt_end']:.0f} deg{'' if r['held_end'] else ' (dropped)'} "
                           f"ft_err={r['ft_err'] * 100:.1f}cm plan={r.get('plan_ms', '')}ms "
                           f"{'OBSTACLE CONTACT ' if r.get('obstacle_contact') else ''}{r.get('note', '')}", flush=True)
                     with open(out / "results.csv", "w", newline="") as f:

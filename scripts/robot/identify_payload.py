@@ -1,15 +1,21 @@
-"""Measure the mass the FR3's gravity model is missing (DROID: the wrist ZED
-camera + its mount, cables) and where it sits on the flange.
+"""Measure the mass a gravity model is missing (DROID: the wrist ZED camera +
+its mount, cables) and where it sits on the flange.
 
-The FR3 compensates gravity with its own model plus the end-effector payload
-set in Desk. Unknown mass (off the gripper axis) leaves a torque that friction
-hides in some poses only: the arm sinks there. At rest, the link-side joint
-torque sensors read the true gravity torque, so
+At rest, the link-side joint torque sensors read the true gravity torque, so
 
-    tau_J - g_robot(q) = (missing load gravity)(q) + sensor offset
+    tau_J - g_model(q) = (missing load gravity)(q) + sensor offset
 
 is linear in [m, m*cx, m*cy, m*cz] (point mass, flange frame) plus a
 per-joint offset, and a least-squares fit over a few poses gives it.
+Unknown mass (off the gripper axis) leaves a torque that friction hides in
+some poses only: the arm sinks there.
+
+``--against urdf`` (default): ``g_model`` is the URDF the controllers send
+(``gravity_model: controller`` in configs/robot/hardware.yaml cancels the
+FR3's own model), which carries the wrist camera as the ``wrist_camera`` body
+of assets/robot/fr3_robotiq_robot.xml. What is left is a correction to that
+body. ``--against robot``: the FR3's own model plus the Desk payload (for
+``gravity_model: robot``; the result is a ``load:`` block).
 
 Run with run_hardware.py STOPPED (this connects to the robot itself):
 
@@ -23,6 +29,7 @@ wrist orientation changes). Then press Enter: the result is printed as the
 """
 
 import argparse
+import os
 import select
 import sys
 import time
@@ -46,9 +53,21 @@ def main():
     ap.add_argument("--hostname", default="192.168.0.113")
     ap.add_argument("--still_time", type=float, default=1.5, help="s at rest per sample")
     ap.add_argument("--min_pose_change", type=float, default=0.3, help="rad between samples")
+    ap.add_argument("--against", choices=("urdf", "robot"), default="urdf",
+                    help="urdf: the controllers' model (gravity_model: controller); robot: the FR3's + Desk")
+    ap.add_argument("--urdf", default="assets/robot/urdf/fr3_robotiq_rigid.urdf")
     args = ap.parse_args()
 
     import panda_py
+
+    gravity_ref = None
+    if args.against == "urdf":
+        import pinocchio as pin
+
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        pm = pin.buildModelFromUrdf(os.path.join(root, args.urdf))
+        pd = pm.createData()
+        gravity_ref = lambda q: pin.computeGeneralizedGravity(pm, pd, np.asarray(q, dtype=float))  # noqa: E731
 
     panda = panda_py.Panda(args.hostname)
     model = panda.get_model()
@@ -70,7 +89,8 @@ def main():
             q, dq = np.array(s.q), np.array(s.dq)
             if np.max(np.abs(dq)) < 0.005:
                 still_since = still_since or time.time()
-                buf.append((q, np.array(s.tau_J), np.array(model.gravity(s))))
+                g = np.array(model.gravity(s)) if gravity_ref is None else gravity_ref(q)
+                buf.append((q, np.array(s.tau_J), g))
                 if time.time() - still_since > args.still_time:
                     qm = np.mean([b[0] for b in buf], axis=0)
                     if all(np.max(np.abs(qm - p)) > args.min_pose_change for p, _ in samples):
@@ -101,6 +121,11 @@ def main():
         return
     c = mc / m
     print(f"Missing load: {m:.3f} kg at {np.round(c, 3).tolist()} m (flange frame)\n")
+    if args.against == "urdf":
+        print("The URDF is missing this. Add it to the wrist_camera body in assets/robot/fr3_robotiq_robot.xml "
+              "(mass, and the centre of mass moved toward this point), then\n"
+              "  python assets/robot/urdf/make_fr3_robotiq_urdf.py\nand run this again.")
+        return
     print("Put this under robot: in configs/robot/hardware.yaml:\n")
     print("  load:")
     print(f"    mass: {m:.3f}")

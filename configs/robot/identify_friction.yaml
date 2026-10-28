@@ -1,0 +1,21 @@
+# Joint friction identification (scripts/robot/identify_friction.py) on the real
+# FR3, under run_hardware.py. Sim: --env_mode sim_real_time with run_env.py.
+ctrl_freq: 1000
+env_mode: real
+# The gravity model the controllers send (gravity_urdf in hardware.yaml).
+urdf_path: assets/robot/urdf/fr3_robotiq_rigid.urdf
+joints: [1, 2, 3, 4, 5, 6, 7]
+speeds: [0.05, 0.1, 0.2, 0.3]  # rad/s, constant-speed passes
+amplitude: 0.2                 # rad each way around the start pose
+limit_margin: 0.15             # rad kept from the joint limits
+# PD tracking the sweep (the controller's earlier position-tracking gains).
+kp: [600, 600, 600, 600, 250, 150, 50]
+kd: [50, 50, 50, 20, 20, 20, 10]
+output_dir: outputs/friction
+
+sub_manager:
+  arm_joint_meas_channel: franka_arm_joint_meas
+  max_sub_freq: 2000
+pub_manager:
+  ctrl_channel: franka_arm_joint_ctrl
+  max_pub_freq: 2000

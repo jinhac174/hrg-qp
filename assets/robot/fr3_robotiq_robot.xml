@@ -308,6 +308,17 @@
                             </body>
                           </body>
                         </body>
+                        <!-- DROID wrist camera: ZED Mini (62.9 g, datasheet) on a 3D-printed mount with
+                             its cable (45 g: an estimate, weigh it and correct the mass). Frame = the
+                             left lens, OpenCV axes, pose = configs/robot/zed.yaml wrist T_link_cam
+                             (calibrated 2026-10-20; fr3_gripper = fr3_link8). The centre of mass sits
+                             between the camera body and the mount. Visual only: no contacts. -->
+                        <body name="wrist_camera" pos="-0.068245 0.041394 0.029241"
+                          quat="-0.681401 0.098722 -0.11046 0.71676">
+                          <inertial mass="0.108" pos="0.0328 0.0146 -0.0055" diaginertia="1.5e-05 0.00015 0.00015"/>
+                          <geom class="robotiq_visual" type="box" size="0.06225 0.01525 0.01325" pos="0.0315 0 -0.010"
+                            material="robotiq_black"/>
+                        </body>
                       </body>
                     </body>
                   </body>

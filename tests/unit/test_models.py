@@ -40,8 +40,10 @@ def test_mjcf_has_arm_and_gripper():
         assert model.joint(n) is not None
     assert model.site("fr3_gripper_tcp") is not None
     b = model.body("fr3_gripper").id
-    mass = sum(model.body_mass[i] for i in range(model.nbody) if _in_subtree(model, i, b))
+    cam = model.body("wrist_camera").id  # the DROID wrist ZED Mini + mount, on the gripper
+    mass = sum(model.body_mass[i] for i in range(model.nbody) if _in_subtree(model, i, b) and i != cam)
     assert mass == pytest.approx(rq.MASS, abs=0.01)
+    assert model.body_parentid[cam] == b and 0.06 < model.body_mass[cam] < 0.2
 
 
 def _in_subtree(model, i, root):

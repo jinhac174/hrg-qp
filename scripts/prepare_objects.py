@@ -23,6 +23,8 @@ bottom); they are fixed here so the output is reproducible.
     python scripts/prepare_objects.py                 # all objects
     python scripts/prepare_objects.py --only blue_bowl
     python scripts/prepare_objects.py --textured_only   # just the FoundationPose meshes
+    python scripts/prepare_objects.py --targets_only    # just fingertip_targets.npz, from the
+                                                        # existing visual.obj / surface points
 """
 
 from __future__ import annotations
@@ -154,6 +156,19 @@ def shell_convex_parts(mesh: trimesh.Trimesh, cell: float, overlap: float = 0.00
     return parts
 
 
+def prepare_targets(name: str, args) -> None:
+    """Only the fingertip targets, from the object's current mesh and
+    distance function (configs/objects/<name>.yaml)."""
+    from omegaconf import OmegaConf
+
+    t0 = time.time()
+    cfg = OmegaConf.load(os.path.join(ROOT, CFG_DIR, f"{name}.yaml"))
+    mesh = trimesh.load(os.path.join(ROOT, cfg.mesh_path), force="mesh")
+    tg = generate_fingertip_targets(mesh, sdf_from_config(cfg.sdf), max_targets=args.max_targets)
+    tg.save(os.path.join(ROOT, cfg.fingertip_targets))
+    print(f"[{name}] {len(tg)} fingertip targets ({time.time() - t0:.0f} s)")
+
+
 def prepare(name: str, spec: dict, args) -> None:
     t0 = time.time()
     out = os.path.join(ROOT, MESH_DIR, name)
@@ -227,9 +242,14 @@ def main():
     ap.add_argument("--cell", type=float, default=0.012, help="convex part size (m)")
     ap.add_argument("--textured_only", action="store_true",
                     help="only (re)write visual_textured.obj, leave the rest as it is")
+    ap.add_argument("--targets_only", action="store_true",
+                    help="only (re)write fingertip_targets.npz, leave the rest as it is")
     args = ap.parse_args()
     for name, spec in OBJECTS.items():
         if args.only and name not in args.only:
+            continue
+        if args.targets_only:
+            prepare_targets(name, args)
             continue
         if args.textured_only and ("extents" in spec or "cup" in spec):
             continue

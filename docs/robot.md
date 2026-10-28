@@ -28,12 +28,19 @@ run_hardware.py  --joint_meas / gripper_state / scene collision geometry-->  run
    `configs/robot/hardware.yaml`, user in `dialout`), or, as in the DROID
    cell, on the NUC behind `scripts/robot/robotiq_tcp_bridge.py`
    (`port: socket://<nuc>:5020`).
-5. **Payload** beyond the gripper (e.g. a wrist camera):
-   `python scripts/robot/identify_payload.py`, then the `load:` block in
-   `configs/robot/hardware.yaml`.
-6. **LCM**: camera frames are ~2 MB, beyond the default UDP receive buffer:
+5. **Payload** beyond the gripper. The DROID wrist camera (ZED Mini + mount)
+   is the `wrist_camera` body of `assets/robot/fr3_robotiq_robot.xml`, so it
+   is in the URDF the controllers send g(q) from (63 g camera, datasheet;
+   45 g mount + cable, an estimate: weigh it and correct the body's mass,
+   then `python assets/robot/urdf/make_fr3_robotiq_urdf.py`). What is still
+   missing: `python scripts/robot/identify_payload.py` (run_hardware stopped;
+   it compares against that URDF). With the paper's low level (no Kp, below)
+   an error here shows as a slow sag, so this matters more than it used to.
+6. **Friction** (once per robot): see "Friction feed-forward" below. Until
+   then `configs/robot/controller.yaml` keeps it off (`friction.scale: 0`).
+7. **LCM**: camera frames are ~2 MB, beyond the default UDP receive buffer:
    `sudo sysctl -w net.core.rmem_max=2147483647 net.core.rmem_default=2147483647`.
-7. **Check**: `python scripts/robot/preflight.py` (no motion), then
+8. **Check**: `python scripts/robot/preflight.py` (no motion), then
    `--connect` (reads the robot and the gripper, no motion).
 
 ### FoundationPose + SAM2 (GPU)
@@ -98,11 +105,15 @@ poses are held out to check the result.
    (`--init config` instead starts from the current `zed.yaml` value: a
    re-check, or a small bump.) Quitting `run_grav_comp.py` (`q`) leaves the
    arm held where it is.
-3. **Capture 8 poses**, spread over the image: arm left / right / reaching /
-   folded, wrist turned. SPACE captures; then click the robot (several links
-   and the gripper) until the green mask covers exactly the robot, right-click
-   what does not belong (table, cables), ENTER. Keep your hands out of the
-   robot's outline when you press SPACE.
+3. **Capture 6 poses**, spread over the image: arm left / right / reaching /
+   folded, wrist turned (4 are fitted, the last 2 held out). Stay out of the
+   camera's view. SPACE captures; the mask comes pre-filled from the tag's
+   guess (the robot's projected outline prompts SAM2). It must cover the
+   whole robot **including the gripper** (the render has it), but not the
+   wrist camera (the render does not), cables, the table or people:
+   left-click what is missing, right-click what does not belong, ENTER.
+   To redo only the masks of a run (the camera not moved since):
+   `--capture_from outputs/calibration/<run>/views.npz`.
 4. **Judge it** (the printed table and `outputs/calibration/zed_ext1_<time>/`):
    held-out IoU close to the fit IoU, the green (rendered) outline on the red
    (mask) one in every `view*_final.png`, "implied tag pose vs measured"
@@ -113,6 +124,30 @@ poses are held out to check the result.
    running (section 3), the object in the browser view must sit where it
    really is; or touch a tracked object's centre with the TCP and measure the
    miss.
+
+### Friction feed-forward
+
+The controller is now the paper's low level, a damping (velocity) controller
+(`kp = 0`, `q_des = q + qdot_des dt`; `docs/method.md`, Sec. II-D). The FR3's
+joint friction is then no longer hidden by a position spring, so it is fed
+forward on the *commanded* joint velocity (`hrg/friction.py`):
+`scale (coulomb tanh(qdot_des / v_smooth) + viscous qdot_des)`, capped per
+joint. It is zero whenever the plan says stop, so it cannot push a holding
+arm.
+
+Measure it once, with `run_hardware.py` running and nothing else commanding
+the arm, from the default pose (each joint moves +-0.2 rad around it, one at a
+time, up to 0.3 rad/s; about 40 s per joint):
+
+```bash
+python run_hardware.py --config configs/robot/hardware.yaml
+python scripts/robot/identify_friction.py --config configs/robot/identify_friction.yaml
+#   ... prints a friction: block -> configs/robot/controller.yaml (keeps scale: 0.5)
+```
+
+`q` stops it (the hardware holds the arm). In the simulation it recovers the
+MuJoCo model's friction (joint 2: 1.15 Nm measured vs 1.137, joints 5 / 7 to
+the mN m). Start with `scale: 0.5`; more is not safer, only more aggressive.
 
 ## Objects: what the method needs per object
 
@@ -202,6 +237,25 @@ python scripts/record_video.py --live --object blue_bowl --duration 30   # optio
 Hand on the user stop. `x` opens the gripper and stops; `h` goes home through
 the same constrained QP.
 
+What the reach does now (the oriented reach, `hrg.orient`; design in
+`docs/superpowers/specs/2026-10-28-oriented-reach-design.md`):
+
+* **Grasp choice.** The hand turns to a grasp orientation **in the object's frame**: from the
+  object's "above" where that is reachable; `approach_axis` in an object config changes the
+  preference. The grasp is the one whose arm configuration (IK) is nearest the current joints,
+  which picks the finger order with the least wrist motion. The first plan of a reach searches for
+  a reachable grasp (up to ~0.2 s, the arm holds). If none is reachable it prints so and holds.
+* **Straight in.** The fingertips travel the last 10 cm straight along the approach, and close only
+  with the hand within 10° (`grasp.grasp_trigger_rot`).
+* **Upright after the lift.** After the 15 cm lift the object is turned back to its upright pose
+  (object +z up, the smallest tilt), raised so it clears the table, until it is within 3°, then
+  held. The object's pose in the hand is taken when the gripper reports the grasp, and refreshed
+  from tracking whenever that is plausible, so an object that pivots in the fingers is turned
+  until upright. If FoundationPose's pose is wrong, so is the turn. `--grasp.upright false` skips
+  it.
+* While held, the object's mass (`mass` in its config) is added to g(q).
+  Set it to the real object's mass.
+
 Objects for the real experiments (paper Sec. III-B): `blue_bowl`, `red_cup`,
 `wine_glass`, `tape` (`configs/objects/`). Obstacles: measure them into
 `configs/robot/obstacles.yaml` and run `scripts/robot/publish_obstacles.py`.
@@ -222,3 +276,9 @@ Objects for the real experiments (paper Sec. III-B): `blue_bowl`, `red_cup`,
 * **Table height.** `grasp.table_z` (0 = the robot base plane). If the table
   is not at the base height, set it (it is also the object's resting plane
   for the targets' validity).
+* **No Kp.** With `kp = 0` the arm is soft between plans: it yields to a
+  push and the planner re-plans from where it is. If plans stop (controller
+  hung, > 0.2 s), the controller holds the joints with `stale_hold_kp`; if
+  the controller dies, `run_hardware.py`'s own hold takes over. To compare
+  with the earlier stiff tracking: `--ref_mode integral --kp
+  [600,600,600,600,250,150,50]`.

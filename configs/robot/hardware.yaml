@@ -29,10 +29,11 @@ robot:
   # holding); the hold (no fresh command) uses gravity_urdf.
   gravity_model: controller
   gravity_urdf: assets/robot/urdf/fr3_robotiq_rigid.urdf
-  # Extra load on top of Desk's (DROID: wrist ZED camera + 3D-printed mount,
-  # off the gripper axis: without it the arm sinks in some wrist poses).
-  # Measure it with scripts/robot/identify_payload.py (run_hardware stopped) and
-  # uncomment:
+  # The wrist ZED Mini + mount is the wrist_camera body of the URDF (from
+  # assets/robot/fr3_robotiq_robot.xml), so gravity_model: controller carries it;
+  # scripts/robot/identify_payload.py (run_hardware stopped) checks what is still
+  # missing. A load: block only matters with gravity_model: robot (it changes the
+  # FR3's own model, which "controller" cancels):
   # load:
   #   mass: 0.15             # kg
   #   com: [0.0, 0.0, 0.0]   # m, flange frame

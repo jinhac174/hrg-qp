@@ -29,6 +29,53 @@ the object is held (`is_grasped`) 5 cm above its rest height within the time
 limit; trials where the bus or a process died are marked `infra` and
 repeated, never counted.
 
+## The oriented reach and the paper's low level (2026-10-28)
+
+The sections after this one were measured before 2026-10-28, with what were
+then the defaults: the paper's reach (fingertip points only) and the stiff
+low level (a running-integral reference with Kp). To reproduce them, add
+`--ctrl hrg.orient=false ref_mode=integral kp=[600,600,600,600,250,150,50]`.
+The defaults are now the oriented reach, the paper's low level (Kp = 0) and
+friction feed-forward (docs/method.md). Everything below was run on the lab
+workstation (rllab2).
+
+**Kinematic rollouts** (`scripts/rollout.py --orientations all --placements
+5`): perfect tracking, the Table I objects × orientations × start poses.
+Converged = both fingertips within 1 cm, and with the oriented reach also
+the hand within 10° of its target orientation (the grasp trigger).
+
+| | converged | hand vs R* at the end | joint 7 turn |
+|---|---|---|---|
+| paper's reach (`hrg.orient=false`) | 172 / 178 | (not steered) | — |
+| oriented reach | 169 / 178 | ≤ 10° (the trigger) | ≤ 110° |
+
+The 9 failures are all a mug lying on its side:
+- **6 placements, no reachable oriented grasp:** the planner reports it and holds. Every
+  approach that is collision-free and swept clear needs joint 6 past its limit.
+- **3 placements, stalled 5 cm short:** link 6 sits at its self-collision margin against
+  link 1. The chosen grasp configuration itself is clear, but the fingertip fields drive
+  along a Cartesian path the arm cannot follow there. That is the paper's own limitation:
+  fingertip targets planned independently of the joints.
+
+Upright objects are approached from above in their own frame, and objects on their side
+from their own "above" where reachable. A wine glass on its side is never approached
+through its opening at table height: link 6 would meet the table and joint 2 its limit,
+so its stem or foot is taken.
+
+**Real-time simulation** (`scripts/eval_sim.py --objects box blue_bowl gold_bowl blue_mug
+wine_glass --orientations all --seeds 2 --timeout 30`): grasp + lift within 30 s, then the
+object's tilt once held, after the upright turn.
+- **78 / 78** grasped, lifted and still held at the end, with no failed closes.
+- Lift time: median 5.4 s, at most 8.5 s after `v`.
+- The object's tilt at the end: at most 5.4° (median 2.8°), including the 48 trials that
+  started lying on their side (83–89°).
+- Gold bowl: 6 / 6, ending within 2° of upright.
+
+**Friction identification in the simulation**
+(`scripts/robot/identify_friction.py`, against MuJoCo's own friction):
+joint 2 Coulomb 1.152 Nm (model 1.137), joint 5 0.763 (0.763), joint 7
+0.248 (0.248); viscous 0.14–0.28 Nm s/rad (model 0.21).
+
 ## Table I: success rates
 
 Paper's protocol: three start poses (left-bottom, center-up, right-bottom),

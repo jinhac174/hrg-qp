@@ -16,6 +16,21 @@ iterations per plan accumulate over plans toward the optimum of eq. (3)
 plan, three iterations from a detour leave the knots bunched at the start, the
 first direction is dominated by that and consecutive plans can alternate.
 
+Straight final approach (the oriented reach; not in the paper): given the
+target hand's approach axis ``z*`` (``approach``), eq. (3) plans to the
+pre-grasp points ``x*_i - approach_dist z*`` and the straight segment from
+there to ``x*_i`` is appended. Once the fingertips' midpoint is inside a
+narrow cone around the targets' (``in_corridor``, with hysteresis; the
+midpoint, so the opening does not matter) the paths are the straight lines
+to the targets, so the last ``approach_dist`` is travelled along the
+approach axis (``targets`` checked that sweep clear). The pre-grasp points
+are spread at the gripper's current opening (until the straight approach the
+posture field of eq. (9) sets the opening, not the targets). The speed is
+eq. (5) on the distance to the targets throughout. ``h_pre``, the distance
+of the fingertips' midpoint to the pre-grasp (x sqrt 2, the scale of the
+paper's stacked ``h``; 0 on the straight approach), is what the posture
+weight of eq. (10) fades on.
+
 The eq. (2) linear attractor ``K (x* - x)`` is the paper's baseline.
 
 Grasp stability, eqs. (6)-(8)
@@ -72,6 +87,9 @@ class FingertipPathField:
         step_bound: float | None = 0.02,
         violation_tol: float = 1e-3,
         max_separation: float | None = 0.085,
+        approach_dist: float = 0.0,
+        corridor_r0: float = 0.005,
+        corridor_slope: float = 0.15,
     ):
         self.v_const = float(v_const)
         self.delta_x = float(delta_x)
@@ -82,11 +100,27 @@ class FingertipPathField:
         self.step_bound = None if step_bound is None else float(step_bound)
         self.violation_tol = float(violation_tol)
         self.max_separation = None if max_separation is None else float(max_separation)
+        self.approach_dist = float(approach_dist)
+        self.corridor_r0 = float(corridor_r0)
+        self.corridor_slope = float(corridor_slope)
         self._prev = None
+        self._inside = None  # key of the target whose corridor the fingertips are in
+        self.h_pre = 0.0  # last call: |x - x_pre| (stacked), 0 on the straight approach
 
     def reset(self) -> None:
         """Forget the previous solution (new reach)."""
         self._prev = None
+        self._inside = None
+
+    def in_corridor(self, x: np.ndarray, x_tgt: np.ndarray, approach: np.ndarray, grow: float = 1.0) -> bool:
+        """The fingertips' midpoint within the cone around the targets'
+        final approach segment: ``s`` back along the approach in ``[-5 mm,
+        approach_dist + 1 cm]``, off its axis at most ``grow (r0 + slope s)``."""
+        v = x.mean(axis=0) - x_tgt.mean(axis=0)
+        s = -float(v @ approach)  # distance back along the approach
+        r = float(np.linalg.norm(v + s * approach))
+        lim = grow * (self.corridor_r0 + self.corridor_slope * max(s, 0.0))
+        return -0.005 <= s <= self.approach_dist + 0.01 * grow and r <= lim
 
     def plan_paths(self, x: np.ndarray, x_tgt: np.ndarray, constraints, key=None) -> np.ndarray:
         """Paths ``(2, num_knots, 3)`` from ``x`` to ``x_tgt``. ``key``
@@ -112,10 +146,37 @@ class FingertipPathField:
         self._prev = (key, out)
         return out
 
-    def __call__(self, x: np.ndarray, x_tgt: np.ndarray, constraints, key=None):
-        """Desired fingertip velocities ``(2, 3)`` (eq. 4) and the paths."""
-        paths = self.plan_paths(x, x_tgt, constraints, key)
-        c0 = paths[:, 1] - paths[:, 0]
+    def __call__(self, x: np.ndarray, x_tgt: np.ndarray, constraints, key=None, approach=None):
+        """Desired fingertip velocities ``(2, 3)`` (eq. 4) and the paths.
+        ``approach``: the target hand's approach axis (unit, world): straight
+        final approach over ``approach_dist`` (``None``: the paper's paths)."""
+        head = None
+        self.h_pre = float(np.linalg.norm(x - x_tgt))
+        if approach is not None and self.approach_dist > 0.0:
+            approach = np.asarray(approach, dtype=float)
+            inside = self.in_corridor(x, x_tgt, approach, grow=1.5 if self._inside == key else 1.0)
+            self._inside = key if inside else None
+            t = np.linspace(0.0, 1.0, self.num_knots).reshape(1, -1, 1)
+            if inside:
+                paths = (1.0 - t) * x[:, None] + t * x_tgt[:, None]
+                self.h_pre = 0.0
+            else:
+                # Pre-grasp points: the targets' midpoint backed off along the approach, the
+                # fingertips spread along the target closing axis at the CURRENT opening (the
+                # posture field sets it until here; the targets set it on the straight approach).
+                m_tgt = x_tgt.mean(axis=0)
+                m_pre = m_tgt - self.approach_dist * approach
+                scale = np.linalg.norm(x[1] - x[0]) / max(float(np.linalg.norm(x_tgt[1] - x_tgt[0])), 1e-9)
+                x_pre = m_pre + (x_tgt - m_tgt) * scale
+                head = self.plan_paths(x, x_pre, constraints, key)
+                tail = (1.0 - t) * x_pre[:, None] + t * x_tgt[:, None]
+                paths = np.stack([path_opt.resample(np.vstack([head[f], tail[f][1:]]), self.num_knots)
+                                  for f in range(len(x))])
+                self.h_pre = float(np.sqrt(2.0) * np.linalg.norm(x.mean(axis=0) - m_pre))
+        else:
+            paths = self.plan_paths(x, x_tgt, constraints, key)
+        first = paths if head is None else head  # the direction is the planned path's
+        c0 = first[:, 1] - first[:, 0]
         n = np.linalg.norm(c0, axis=1, keepdims=True)
         direction = np.where(n > 1e-9, c0 / np.maximum(n, 1e-12), 0.0)
         e = np.linalg.norm(x_tgt - x, axis=1)

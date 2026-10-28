@@ -9,7 +9,9 @@ friction, timing) in the real-time simulation.
 
 Per rollout: converged (both fingertips within ``--tol`` of their targets
 within ``--time`` s), time, final fingertip error, and the smallest clearance
-of the hand spheres to the object and the table along the way. A rollout
+of the hand spheres to the object and the table along the way; with the
+oriented reach (``hrg.orient``) also the hand's final angle to its target
+orientation and how far joint 7 turned. A rollout
 that does not converge prints what binds at the end (collision rows at their
 margin, joints at their limits). ``scripts/dissect.py`` does the same for a
 recorded simulation trial.
@@ -52,8 +54,8 @@ def make_planner(obj: str, field: str, overrides=()) -> tuple[ReachPlanner, Gras
                        cfg.env_col_margin, cfg.self_col_margin)
     robot.set_collision_geometry(*scene_collision_info(OmegaConf.load(resolve(ENV_CFG)).scene_xml_path))
     planner = ReachPlanner(HRGParams.from_config(cfg.hrg), robot,
-                           FingertipTargets.load(resolve(o.cfg.fingertip_targets)), sdf_from_config(o.cfg.sdf),
-                           table_z=float(cfg.grasp.table_z))
+                           FingertipTargets.load(resolve(o.cfg.fingertip_targets), o.cfg.get("approach_axis")),
+                           sdf_from_config(o.cfg.sdf), table_z=float(cfg.grasp.table_z))
     return planner, o
 
 
@@ -74,9 +76,13 @@ def placements(n: int, seed: int, obj: GraspObject, rpy=(0.0, 0.0, 0.0)):
     return out
 
 
-def rollout(planner: ReachPlanner, q0, T_obj, horizon: float, dt: float, tol: float) -> dict:
+def rollout(planner: ReachPlanner, q0, T_obj, horizon: float, dt: float, tol: float,
+            rot_tol: float = np.radians(10.0)) -> dict:
+    """``rot_tol``: with the oriented reach, the hand must also be this close
+    to its target orientation (the controller's ``grasp_trigger_rot``)."""
     planner.reset()
-    q, w = np.array(q0, dtype=float), MAX_WIDTH
+    q0 = np.asarray(q0, dtype=float)
+    q, w = q0.copy(), MAX_WIDTH
     data = planner.robot.data()
 
     def clearances(q, w):
@@ -98,9 +104,10 @@ def rollout(planner: ReachPlanner, q0, T_obj, horizon: float, dt: float, tol: fl
         err = np.linalg.norm(r.x - r.x_tgt, axis=1)
         co, ct = clearances(q, w)
         clear_obj, clear_table = min(clear_obj, co), min(clear_table, ct)
-        if np.all(err < tol):
+        if np.all(err < tol) and not r.info.get("rot_err", 0.0) > rot_tol:
             return dict(converged=True, t=k * dt, err=float(err.max()), clear_obj=clear_obj,
-                        clear_table=clear_table, note="")
+                        clear_table=clear_table, note="", rot=float(r.info.get("rot_err", np.nan)),
+                        dq7=float(abs(q[6] - q0[6])))
         q = q + r.qd * dt
         w = float(np.clip(w + r.wd * dt, 0.0, MAX_WIDTH))
     return dict(converged=False, t=np.nan, err=float(err.max()), clear_obj=clear_obj, clear_table=clear_table,
@@ -137,10 +144,14 @@ def main():
                               flush=True)
                 res = [r for r in res if not r["note"].startswith("invalid start")]
                 ts = [r["t"] for r in res if r["converged"]]
+                rot = [np.degrees(r["rot"]) for r in res if r["converged"] and np.isfinite(r["rot"])]
+                dq7 = [np.degrees(r["dq7"]) for r in res if r["converged"]]
+                ori_txt = (f", hand {np.max(rot):.1f} deg off at most, joint 7 turned {np.max(dq7):.0f} deg at most"
+                           if rot else "")
                 print(f"{field:6s} {obj:11s} {ori:7s} {pose:12s} {sum(r['converged'] for r in res):3d}/{len(res)} "
                       f"converged, t {np.median(ts) if ts else np.nan:.1f} s median, min clearance obj "
                       f"{min(r['clear_obj'] for r in res) * 100:.1f} cm, table "
-                      f"{min(r['clear_table'] for r in res) * 100:.1f} cm", flush=True)
+                      f"{min(r['clear_table'] for r in res) * 100:.1f} cm{ori_txt}", flush=True)
 
 
 if __name__ == "__main__":

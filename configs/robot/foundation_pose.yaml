@@ -23,9 +23,18 @@ sam2:
   mask_depth: false
   obj_id: 1
 
-auto_reset:
+auto_reset:               # score-based (its level depends on the object: off for the gold bowl)
   enable: true
   score_threshold: 100.0
+  streak: 3
+
+# Lost tracking, any object: the model projected with the tracked pose must cover
+# the SAM2 mask; if not for `streak` frames, no pose is published and the object
+# is registered again from the mask (a dropped / moved object is picked up again).
+# While tracking: click the object = re-select it, r = register again.
+lost_detect:
+  enable: true
+  min_agreement: 0.5       # fraction of the model's projected points inside the mask
   streak: 3
 
 visualize_sam: true
@@ -36,9 +45,12 @@ visualize: true
 quiet_logs: true
 fps_report_every: 30
 
+# Low-pass on SE(3) (fr3/utils/filtering/SE3LowPassFilter.py). Raw FoundationPose on the
+# gold bowl at rest, 24 Hz (2026-10-28): 1.2 mm / 0.6 deg per frame (median), 3.8 mm / 2.7
+# deg max. alpha 0.4 roughly halves the frame-to-frame jitter for ~60 ms of lag.
 pose_filter:
-  use_filter: false
-  alpha: 0.7
+  use_filter: true
+  alpha: 0.4
   window_size: 0
   fix_x_rotation: false
   fix_z_rotation: false

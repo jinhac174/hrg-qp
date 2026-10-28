@@ -25,14 +25,13 @@ zed:
     # NOT the camera's pose in the base (that is its inverse, T_cam2base);
     # perception computes cam2world = inv(this). Calibrate it with
     # run_camera_calibration.py (docs/robot.md) and paste the result here.
-    # Calibrated 2026-10-26 (AprilTag + 8 views, outputs/calibration/zed_ext1_20261026_210933),
-    # refitted offline without views 2 and 3, whose SAM2 masks leaked onto the person
-    # behind the robot (outputs/calibration/zed_ext1_20261026_211143_refit): fit IoU 0.83,
-    # held-out IoU 0.82, outline 5.6 px; implied tag pose 13 mm / 0.85 deg from the measured.
-    # The camera had moved 3.6 cm / 3.9 deg since the 2026-10-19 value (IoU 0.64 on these views).
+    # Calibrated 2026-10-28 22:12 after the camera was knocked (turned 6.1 deg: table points
+    # 8-12 cm off with the 20:31 value). AprilTag + 6 views (outputs/calibration/
+    # zed_ext1_20261028_221230): fit IoU 0.82, held-out IoU 0.83, outline 6.6 px held out;
+    # implied tag pose 4.1 mm / 0.75 deg from the measured.
     tf_link_to_cam:
-      quaternion: [-0.079063, 0.768311, -0.632755, -0.055394]   # x, y, z, w
-      translation: [0.319405, 0.366440, 0.729541]
+      quaternion: [-0.209565, 0.770287, -0.580253, -0.161389]   # x, y, z, w
+      translation: [0.465998, 0.309959, 0.790702]
   ext2:
     serial: 0              # SET: ZED 2, right side of the table
     resolution: HD720

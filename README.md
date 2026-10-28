@@ -10,7 +10,16 @@ At 100 Hz, at the measured state: select fingertip targets on the object
 directions as velocity fields (eqs. 3-5), add the gripper-posture and
 grasp-stability fields (eqs. 6-10), and track all of them with one joint-space
 QP under the full robot's collision and limit constraints (eq. 11). At 1 kHz:
-PD on the integrated QP velocity, with gravity compensation.
+the paper's low level, PD on the QP velocity integrated over one control
+interval (a damping controller: Kp is 0), with gravity (wrist camera and held
+object included) and friction feed-forward.
+
+Beyond the paper (`hrg.orient`, on by default): the **oriented reach**. Every
+target pair has a hand orientation in the object's frame; the QP also tracks
+it (`γ |ω*_R − J_ω z|²` in eq. 11), the wrist turns at most ~90° to the nearer
+finger order, the last 10 cm come in straight along the approach, and after
+the lift the object is turned back to its upright pose
+([design](docs/superpowers/specs/2026-10-28-oriented-reach-design.md)).
 
 * **[docs/method.md](docs/method.md)**: the paper equation by equation, where each piece is in the code, and every FR3 / 2F-85 adaptation with its reason.
 * **[docs/results.md](docs/results.md)**: the simulation studies (Table I, Figs. 6-8) and their limits.

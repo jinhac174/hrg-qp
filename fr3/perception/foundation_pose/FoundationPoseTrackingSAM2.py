@@ -6,6 +6,16 @@ per-frame mask to zero out background in RGB/depth before feeding
 FoundationPose's track_one. This stabilizes tracking in cluttered scenes
 and enables auto re-registration when observations drift from the mesh.
 
+Lost tracking (``lost_detect``): every frame, the fraction of the model's
+points, projected with the tracked pose, that fall inside the SAM2 mask (which
+SAM2 keeps following, e.g. when a released object drops). Below
+``min_agreement`` for ``streak`` frames the pose is not published and the
+object is registered again from the mask, so a dropped or moved object is
+picked up again without a restart. During tracking, a click on the object
+re-selects it (SAM2 from that click) and ``r`` registers again from the
+current mask. This works for any object, unlike the tracking score
+(``auto_reset``), whose level depends on the object.
+
 Requires the segment-anything-2-real-time fork (SAM2CameraPredictor).
 """
 
@@ -108,6 +118,14 @@ class FoundationPoseTrackingSAM2(BasePerception):
         self._auto_reset = auto_cfg.get("enable", False)
         self._auto_reset_score_threshold = auto_cfg.get("score_threshold", 100.0)
         self._auto_reset_streak = auto_cfg.get("streak", 10)
+        lost_cfg = config.get("lost_detect", {})
+        self._lost_detect = bool(lost_cfg.get("enable", True))
+        self._min_agreement = float(lost_cfg.get("min_agreement", 0.5))
+        self._lost_streak_needed = int(lost_cfg.get("streak", 3))
+        self._lost_streak = 0
+        self._lost = False
+        verts = np.asarray(self._mesh.vertices, dtype=np.float32)
+        self._agree_pts = verts[np.random.default_rng(0).choice(len(verts), min(500, len(verts)), replace=False)]
         self._trigger_streak = 0
 
         self._glctx = dr.RasterizeCudaContext()
@@ -313,6 +331,35 @@ class FoundationPoseTrackingSAM2(BasePerception):
             depth_out[~mask] = 0
         return rgb_out, depth_out
 
+    def _register(self, rgb, depth, mask, why: str) -> bool:
+        """Register the object again from ``mask`` (False if the mask is empty)."""
+        if mask is None or int(mask.sum()) < 50:
+            return False
+        self._pose = self._estimator.register(
+            K=self._K_cropped, rgb=rgb, depth=depth, ob_mask=mask, iteration=self._est_refine_iter,
+        )
+        if self._use_filter and self._pose_filter is not None:
+            self._pose_filter.reset()
+        self._lost, self._lost_streak, self._trigger_streak = False, 0, 0
+        print(f"[FoundationPose] {why}: registered again.")
+        return True
+
+    def _mask_agreement(self, pose, mask) -> float:
+        """Fraction of the model's points, projected with ``pose``, inside the
+        (slightly dilated) mask; points behind the camera or off the image count
+        as outside."""
+        pc = self._agree_pts @ pose[:3, :3].T + pose[:3, 3]
+        front = pc[:, 2] > 1e-3
+        if not np.any(front):
+            return 0.0
+        uv = pc[front] @ np.asarray(self._K_cropped, dtype=np.float64).T
+        uv = uv[:, :2] / uv[:, 2:3]
+        H, W = mask.shape
+        inb = (uv[:, 0] >= 0) & (uv[:, 0] < W) & (uv[:, 1] >= 0) & (uv[:, 1] < H)
+        m = cv2.dilate(mask.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+        ui = uv[inb].astype(int)
+        return float(m[ui[:, 1], ui[:, 0]].sum()) / len(self._agree_pts)
+
     def _track_score(self, rgb, depth):
         """FoundationPose scorer value for the pose track_one just produced.
 
@@ -454,8 +501,17 @@ class FoundationPoseTrackingSAM2(BasePerception):
 
         # ----- Tracking: crop every frame, run SAM + FoundationPose -----
         rgb_crop, depth_crop = self._crop_rgbd(rgb_full, depth_full_meter)
+        if self._clicked_point is not None:  # re-select: SAM2 from this click, register again
+            pt, self._clicked_point = self._clicked_point, None
+            mask = self._run_sam_prompt(rgb_crop, pt, reload_first_frame=True)
+            self._register(rgb_crop, depth_crop, mask, "Object re-selected")
+            return
         mask = self._sam2_step(rgb_crop)
         mask = self._resize_mask_if_needed(mask, rgb_crop.shape[:2])
+        if self._last_key == ord("r"):
+            self._last_key = -1
+            self._register(rgb_crop, depth_crop, mask, "r")
+            return
 
         rgb_in, depth_in = self._apply_mask(rgb_crop, depth_crop, mask)
         self._pose = self._estimator.track_one(
@@ -467,6 +523,18 @@ class FoundationPoseTrackingSAM2(BasePerception):
             iteration=self._track_refine_iter,
         )
         self._report_fps()
+
+        # Lost: the tracked pose no longer covers SAM2's object (see the module docstring).
+        if self._lost_detect and self._pose is not None:
+            agreement = self._mask_agreement(self._pose, mask)
+            self._lost_streak = self._lost_streak + 1 if agreement < self._min_agreement else 0
+            if self._lost_streak >= self._lost_streak_needed:
+                if not self._lost:
+                    print(f"[FoundationPose] Tracking lost (pose covers {agreement:.0%} of the mask): "
+                          "not publishing; registering again from the SAM2 mask.")
+                self._lost = True
+                self._register(rgb_crop, depth_crop, mask, "Tracking lost")
+                return
 
         # Score-based lost detection (see _track_score). On outliers the score
         # blows up past score_threshold; treat that as lost and re-register

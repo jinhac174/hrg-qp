@@ -530,4 +530,21 @@
     <parent link="robotiq_left_follower"/>
     <child link="robotiq_left_pad"/>
   </joint>
+  <link name="wrist_camera">
+    <inertial>
+      <origin xyz="0.0328 0.0146 -0.0055" rpy="0 0 0"/>
+      <mass value="0.108"/>
+      <inertia ixx="1.5e-05" ixy="0" ixz="0" iyy="0.00015" iyz="0" izz="0.00015"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0315 0 -0.01" rpy="0 -0 0"/>
+      <geometry><box size="0.1245 0.0305 0.0265"/></geometry>
+      <material name=""><color rgba="0.149000004 0.149000004 0.149000004 1"/></material>
+    </visual>
+  </link>
+  <joint name="wrist_camera_joint" type="fixed">
+    <origin xyz="-0.068245 0.041394 0.029241" rpy="-0.297255482 0.00901527262 -1.62271473"/>
+    <parent link="fr3_gripper"/>
+    <child link="wrist_camera"/>
+  </joint>
 </robot>

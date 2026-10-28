@@ -172,27 +172,39 @@ s.t.   Γ(q) + dΓ/dz z H >= ε_Γ                     robot vs walls / floor, r
 
 Paper: "Given `qdot_des` from (11), we integrate over one control interval to
 obtain the desired joint position and then apply PD control with gravity
-compensation." Every 1 ms:
+compensation." Every 1 ms (`ref_mode: step`):
 
 ```
-q_des ← q_des + qdot_des dt                 (|q_des − q| <= 0.05 rad)
-τ     = Kp (q_des − q) + Kd (qdot_des − qdot) + g(q) + C(q, qdot) qdot
+q_des = q + qdot_des dt
+τ     = Kp (q_des − q) + Kd (qdot_des − qdot) + g(q) + C(q, qdot) qdot + τ_f(qdot_des)
 ```
 
-* The desired position is the running integral of the commands. An earlier
-  version restarted it from the measured `q` every tick. That leaves
-  `Kp (q_des − q) = Kp qdot_des dt` ≈ 0.02 Nm, a pure damper that the FR3's
-  0.2–1 Nm joint friction stops at low commanded speeds (the eq. (2)
-  baseline then stalled 2–3 cm from every target).
-* The QP is solved at the measured state, so a push or a lag is fed back at
-  the next plan (10 ms).
-* `Kp = [600 ×4, 250, 150, 50]`, `Kd = [50 ×3, 20 ×3, 10]`.
+* `Kp (q_des − q) = Kp dt qdot_des` is about 1 % of the Kd term (600 × 1 ms
+  next to 50), the same direction: `Kp = 0`. The law is a damping (velocity)
+  controller, `Kd = [50 ×3, 20 ×3, 10]`; position is fed back by the planner,
+  which solves the QP at the measured state every 10 ms. States that command
+  no motion (idle, close, reopen, hold) hold the joints through the planner
+  (`hold_gain (q_hold − q)`), not through Kp.
+* **[FR3]** That leaves joint friction and gravity-model errors unhidden: an
+  unmodelled torque Δτ becomes a velocity error Δτ / Kd. Hence the friction
+  feed-forward `τ_f` (`hrg/friction.py`): `scale (f_c tanh(qdot_des / v_s) +
+  f_v qdot_des)`, capped, on the *commanded* velocity (zero when the plan
+  stops; an over-estimate is not negative damping), `scale = 0.5`. Sim: the
+  MuJoCo model's `frictionloss` / `damping`; robot: measured by
+  `scripts/robot/identify_friction.py`. And the payload: the wrist camera is
+  in the URDF, a held object's weight is added while it is held.
+* `ref_mode: integral` is the earlier variant (`q_des ← q_des + qdot_des dt`,
+  within 0.05 rad of `q`, `Kp = [600 ×4, 250, 150, 50]`): Kp is then the
+  integral of the velocity error, which hides friction and model errors
+  behind a stiff spring (the eq. (2) baseline restarted from `q` without
+  friction compensation stalled 2–3 cm from its targets).
 * `g(q) + C qdot` from the URDF. **[FR3]** The hardware process cancels the
   FR3's own gravity compensation (`gravity_model: controller`), so sim and
   robot see the same law.
 * **[FR3]** `qdot_des` passes a first-order filter (0.25 per tick, ~4 ms):
   the plan changes in steps at 100 Hz and libfranka rejects torque
-  discontinuities. If no plan arrives for 0.2 s, `qdot_des = 0`.
+  discontinuities. If no plan arrives for 0.2 s the joints are held where
+  they were (`stale_hold_kp` / `kd`).
 * **[2F-85]** The Robotiq is position-servoed (and so is its sim). `wdot_des`
   is realised the same way, as a set-point `w_ref += wdot_des dt` kept within
   1 cm of the measured width and streamed as `move` commands at 50 Hz.
@@ -212,7 +224,72 @@ object is lifted."
   gripper opens and the reach starts again. If the object is lost during the
   lift or hold, the same happens.
 * Lift: the TCP 15 cm straight up through the same QP (a pose field as the
-  task; `Γ` and the hand vs table / obstacles as constraints), then hold.
+  task; `Γ` and the hand vs table / obstacles as constraints, plus 64 points
+  of the held object vs the table), then (not in the paper) **upright**: the
+  hand pose that puts the object back in its upright pose (object `+z` up,
+  the smallest tilt about the TCP, raised until it clears the table by
+  3 cm), from the object's pose in the hand recorded when the gripper
+  reported the grasp. Tracking refreshes it after the rise and after the
+  turn when plausible (the grasped point still within 2 cm between the pads,
+  the object turned at most 45°): a bowl or glass that pivoted in the
+  fingers is corrected, twice at most. Then hold.
+
+## Beyond the paper: the oriented reach — `planner._select_oriented`, `targets`, `fields`
+
+The paper steers fingertip *points*. On the parallel jaw, reaching both points fixes the closing
+axis at the end, but not the roll about it, i.e. the approach direction, so a rotated object is not
+approached in its own frame. Design and history:
+`docs/superpowers/specs/2026-10-28-oriented-reach-design.md`.
+
+```
+min_z  Σ_i |xdot*_i − J_i z|² + α Σ_i |ω_i,des − J_ω z|² + Σ_n α(θ_n) |J_r,b z − ω_des,b,n|²
+       + κ |qdot − k_q (q_grasp − q)|² + β(h_pre) |wdot* − S z|² + reg |z|²
+ω_des,b,n = R_sbᵀ sat( k (R_sb n̂_b) × n̂_t, ω_max ),   α(θ_n) = γ min(1, θ_n / θ_0)
+n: the pads' normal (TCP y) → the pair axis (the wall's normal), the approach (TCP z) → z*
+R* = R_obj R_grasp,j,k (· Rz(π) for the other finger order)
+```
+
+* **Target data.**
+  - Every pair has 24 approach directions about its axis. One is admissible if the open hand is
+    clear at the pre-grasp and swept back 10 cm along it.
+  - `R_grasp = [y × z, y, z]`, with `y` the pair axis and `z` the approach, in the object frame.
+  - Rim pinches come in two kinds per rim hit: horizontal (T2SQNet's) and along the wall's normal.
+    Of two at the same place the more antipodal one is kept (`misalign`). On the gold bowl's
+    22°-slanted wall a horizontal pinch squeezed the bowl 22° out of upright.
+* **The grasp is chosen in joint space**, every plan, replacing eq. (12):
+  - Candidates: every usable (pair, direction, finger order).
+  - Cost: the joint motion to its configuration `|q_grasp − q|` (IK; reachable = joint range and Γ
+    clear), plus 2 rad per rad between its approach and the object's preferred one
+    (`approach_axis`, from above by default).
+  - The first-order estimate `|J⁺ e|` ranks them; the cheapest few are solved by IK, warm-started
+    from cached solutions.
+  - The current choice keeps winning as the arm closes in on its configuration. With no reachable
+    grasp the plan is `None` and the controller holds.
+* **The posture task** `κ = 0.05` toward `q_grasp` makes the arm end in the configuration the choice
+  was made for. Without it the QP reached the same hand orientation on the other wrist branch,
+  joint 7 half a turn further.
+* **Final approach.**
+  - The fingertip paths (eq. 3) end at pre-grasp points: the targets' midpoint 10 cm back along
+    `z*`, the fingertips spread at the current opening. Then comes the straight segment in.
+  - Inside the corridor (the midpoint within a cone around the targets') the paths are straight
+    lines.
+  - The gripper posture weight `β` fades with the midpoint's distance to the pre-grasp. Pre-grasp
+    points at the target opening, against a posture field holding the gripper open, deadlocked the
+    QP.
+* **Alignment.** For each vector pair, the gripper's `n̂_b` turns toward the target's
+  `n̂_t` at `k |n̂ × n̂_t|`, capped at `ω_max` (`k = 2 /s`, `ω_max = 1 rad/s`: capped above
+  30°). The weight `α(θ)` is `γ = 0.1` while the vectors are more than `θ_0 = 30°` apart and
+  falls linearly to 0 as they align. The pads' normal onto the wall's normal is what makes the
+  grasp antipodal. The approach onto `z*` fixes the remaining roll about the wall's normal,
+  i.e. from where the hand comes, in the object's frame. The gripper closes only within 10°
+  of `R*`.
+* **Limits** (kinematic rollouts, `docs/results.md`):
+  - Objects lying on their side near the base can have no reachable oriented grasp; the planner
+    says so.
+  - A few stall at the arm's self-collision margin while the grasp configuration itself is clear:
+    the paper's own limitation (fingertip targets planned independently of the joints).
+  - A wine glass on its side is not approached through its opening at table height: link 6 would
+    meet the table and joint 2 its limit. Its stem or foot is taken.
 
 ## What the paper leaves open, and the choices made
 
@@ -227,6 +304,10 @@ object is lifted."
 
 ## Known limitations
 
+* **Object pose in the hand.** The upright turn trusts the object's pose
+  recorded at the grasp, refreshed from tracking when plausible; without
+  tracking, an object that pivots in the fingers afterwards (a heavy bowl
+  pinched at its rim) ends tilted by that much.
 * **Fingertip-only targets.** Paper Fig. 12 and Sec. IV: "fingertip velocity
   targets are planned independently of the full joint configuration." On the
   FR3 this shows when an object lies on its side close to the base: the

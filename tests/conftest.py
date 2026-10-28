@@ -21,6 +21,7 @@ os.chdir(REPO)
 # Isolated LCM bus for this test session (processes started by the tests
 # inherit it): tests never talk to a sim / robot you have running.
 os.environ.setdefault("LCM_DEFAULT_URL", f"udpm://239.255.76.67:{random.randint(20000, 29999)}?ttl=0")
+os.environ["HRG_LOG"] = "0"  # the processes' outputs/logs copies (hrg.cli): tests keep their own logs
 
 
 def pytest_report_header(config):

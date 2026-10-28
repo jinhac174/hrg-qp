@@ -86,11 +86,15 @@ def test_hardware_and_controller_in_real_mode(procs):
 
 def test_grav_comp_floats_the_arm(procs):
     """run_grav_comp.py (hand-guiding for the camera calibration) on the fake
-    FR3: the safety layer accepts its gravity, and the arm floats in place."""
+    FR3: the safety layer accepts its gravity, and the arm floats in place.
+    Friction compensation off: the fake plant has no friction for it to
+    cancel, and on a frictionless plant it would drive the arm (on the robot
+    it stays below the measured friction)."""
     with Listener(CHANNELS) as lst:
         hw = procs.start("hw", *HW)
         assert lst.wait_for(lambda: "franka_arm_joint_meas" in lst.last, STARTUP), "hardware did not publish"
-        gc = procs.start("grav_comp", "run_grav_comp.py", "--config", "configs/robot/grav_comp.yaml")
+        gc = procs.start("grav_comp", "run_grav_comp.py", "--config", "configs/robot/grav_comp.yaml",
+                         "--friction.scale", "0.0")
         assert lst.wait_for(lambda: lst.count["franka_arm_joint_ctrl"] > 500, STARTUP), gc.log()[-2000:]
         lst.reset_counts()
         lst.spin(2.0)

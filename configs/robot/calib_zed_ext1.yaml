@@ -13,8 +13,11 @@ num_hand_joints: 1
 
 ground_truth: false        # real camera: the extrinsic in zed.yaml is only the configured value
 
-num_captures: 8            # arm poses; the last num_holdout are not fitted, only evaluated
-num_holdout: 2
+num_captures: 6            # arm poses; the last num_holdout are not fitted, only evaluated
+num_holdout: 2             # (4 fitted views fix the 6 DoF from the tag's guess; 2 check it)
+# Re-use an earlier run's images and joint angles (the camera has not moved):
+# segment again only. --capture_from outputs/calibration/<run>/views.npz
+capture_from: null
 
 urdf_path: assets/robot/urdf/fr3_robotiq.urdf   # with the 2F-85's moving linkage (rendered)
 max_faces: 0

@@ -4,8 +4,12 @@ Pipeline (tutorial 14):
 
 1. Capture. Pose the arm (gravity compensation, by hand); SPACE stores the
    RGB image, the joint angles q, the AprilTag detection (if the tag is
-   visible) and the URDF mesh at q in the base frame. For each capture you
-   click the robot and SAM2 returns its mask.
+   visible) and the URDF mesh at q in the base frame. For each capture SAM2
+   segments the robot: where the tag is seen, it starts from the robot's
+   outline projected with the tag's camera guess (points inside it, the
+   gripper included, and around it); you add clicks where that mask is
+   wrong and accept. ``capture_from: <run>/views.npz`` re-uses the images and
+   joint angles of an earlier run (same camera pose): only the masks again.
 2. Initial guess (``init``). ``apriltag``: camera pose from the tag on the
    desk (``tag_in_base``, measured by you) and the tag's pose in the image.
    ``config``: the extrinsic the camera info already carries (a previous
@@ -329,17 +333,19 @@ class DiffBaseToCamCalibrator:
             _, _, logits = self._sam2.add_new_prompt(frame_idx=0, obj_id=1, points=pts, labels=lbl)
         return (logits[0] > 0.0).squeeze(0).detach().cpu().numpy().astype(bool)
 
-    def _sam2_mask(self, rgb: np.ndarray) -> np.ndarray:
+    def _sam2_mask(self, rgb: np.ndarray, prompt=None) -> np.ndarray:
         """Interactive segmentation: click, see the mask, fix it, accept.
 
         Left click = robot, right click = NOT robot (removes a part SAM2
         added wrongly, e.g. the table or a cable). The mask is recomputed
-        after every click and shown in green. ENTER accepts, R starts over."""
-        clicks: List[Tuple[int, int]] = []
-        labels: List[int] = []
+        after every click and shown in green. ENTER accepts, R starts over
+        (without the automatic prompt). ``prompt``: initial ``(points,
+        labels)`` (``_auto_prompt``)."""
+        clicks: List[Tuple[int, int]] = [] if prompt is None else [tuple(map(int, p)) for p in prompt[0]]
+        labels: List[int] = [] if prompt is None else [int(x) for x in prompt[1]]
         win = "SAM2: LMB robot, RMB not robot, ENTER accept, R reset"
         base = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        state = {"mask": None, "dirty": False}
+        state = {"mask": None, "dirty": bool(clicks)}
 
         def on_mouse(event, x, y, flags, param):
             if event in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_RBUTTONDOWN):
@@ -349,8 +355,9 @@ class DiffBaseToCamCalibrator:
 
         cv2.namedWindow(win)
         cv2.setMouseCallback(win, on_mouse)
-        print("[Calib] Click the robot (several links AND the gripper); right-click what "
-              "should not be in the mask. Check the green mask, then ENTER.")
+        print("[Calib] The green mask must cover the whole robot, gripper included (not the wrist "
+              "camera, cables or table). Left-click what is missing, right-click what does not "
+              "belong, then ENTER.")
         while True:
             if state["dirty"]:
                 state["mask"] = self.sam2_from_clicks(rgb, clicks, labels)
@@ -375,6 +382,60 @@ class DiffBaseToCamCalibrator:
                 raise RuntimeError("SAM2 selection cancelled")
         cv2.destroyWindow(win)
         return state["mask"]
+
+    def _auto_prompt(self, rgb: np.ndarray, q: np.ndarray, det, n_in: int = 12, n_out: int = 8):
+        """SAM2 prompt from the tag's camera guess: ``n_in`` points spread over
+        the robot's projected outline (eroded, so a few cm of guess error stay
+        inside; farthest-point spread reaches the gripper), ``n_out`` in a ring
+        around it. ``None`` without a tag detection."""
+        if det is None or self._tag_cfg is None:
+            return None
+        if self._renderer is None:
+            self._renderer = DiffSilhouetteRenderer(
+                self._K, self._H, self._W, gray=float(self.cfg.get("render_gray", 0.7)), device="cuda"
+            )
+        mesh = self._fk.mesh_at_q(q)
+        v = {"vertices": np.asarray(mesh.vertices, np.float32), "faces": np.asarray(mesh.faces, np.int32)}
+        sil = self._render_mask(v, tag.cam_in_base_from_tag(self._T_base_tag, det.T_cam_tag)).astype(np.uint8)
+        k = lambda r: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))  # noqa: E731
+        inner = cv2.erode(sil, k(6)) > 0
+        ring = (cv2.dilate(sil, k(30)) > 0) & ~(cv2.dilate(sil, k(14)) > 0)
+
+        def spread(m, n):
+            ys, xs = np.nonzero(m)
+            if not len(xs):
+                return np.zeros((0, 2), int)
+            P = np.c_[xs, ys]
+            idx = [int(np.argmin(P[:, 0] + P[:, 1]))]
+            d = np.linalg.norm(P - P[idx[0]], axis=1)
+            for _ in range(min(n, len(P)) - 1):
+                idx.append(int(np.argmax(d)))
+                d = np.minimum(d, np.linalg.norm(P - P[idx[-1]], axis=1))
+            return P[idx]
+
+        pin, pout = spread(inner, n_in), spread(ring, n_out)
+        return np.r_[pin, pout], np.r_[np.ones(len(pin), int), np.zeros(len(pout), int)]
+
+    def load_views(self, path: str) -> List[dict]:
+        """Views from an earlier run's ``views.npz`` (images, joint angles),
+        segmented again; the camera must not have moved since."""
+        info = self._wait_camera_info()
+        self._K = info.get_intrinsic().astype(np.float64)
+        self._T_info_w2c = info.get_extrinsic().astype(np.float64)
+        self._T_info_c2b = invSE3(self._T_info_w2c)
+        self._H, self._W = info.get_img_dim()
+        d = np.load(path)
+        views = []
+        for i, (rgb, q) in enumerate(zip(d["rgb"], d["q"])):
+            det = self._detect_tag(rgb)
+            print(f"[Calib] Saved view {i + 1}/{len(d['q'])}"
+                  + (f", tag reproj {det.reproj_err_px:.2f} px" if det is not None else ", tag not seen"))
+            mask = self._sam2_mask(rgb, self._auto_prompt(rgb, q, det))
+            mesh = self._fk.mesh_at_q(q)
+            views.append({"rgb": rgb, "q": q, "mask": mask, "tag": det,
+                          "vertices": np.asarray(mesh.vertices, dtype=np.float32).copy(),
+                          "faces": np.asarray(mesh.faces, dtype=np.int32).copy()})
+        return views
 
     def _detect_tag(self, rgb: np.ndarray):
         if self._tag_cfg is None:
@@ -477,7 +538,7 @@ class DiffBaseToCamCalibrator:
                 f"arm_q(rad)={np.array2string(snap_q[: self.num_arm], precision=3)}  "
                 + (f"tag reproj {det.reproj_err_px:.2f} px" if det is not None else "tag not seen")
             )
-            mask = self._sam2_mask(snap_rgb)
+            mask = self._sam2_mask(snap_rgb, self._auto_prompt(snap_rgb, snap_q, det))
             mesh = self._fk.mesh_at_q(snap_q)
             views.append(
                 {
@@ -797,7 +858,8 @@ class DiffBaseToCamCalibrator:
     def run(self) -> np.ndarray:
         self._install_signal_handlers()
         try:
-            views = self.capture_views()
+            src = self.cfg.get("capture_from", None)
+            views = self.load_views(str(src)) if src else self.capture_views()
             T_final, out_dir = self.calibrate(views)
             print("[Calib] Press any key in an image window (or Ctrl+C) to close.")
             cv2.imshow("final overlay (view 0)", cv2.imread(os.path.join(out_dir, "view0_final.png")))

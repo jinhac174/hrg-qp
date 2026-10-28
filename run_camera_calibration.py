@@ -5,6 +5,8 @@ Needs run_hardware.py, run_sensors.py and run_grav_comp.py running (docs/robot.m
 
     python run_camera_calibration.py --config configs/robot/calib_zed_ext1.yaml
     python run_camera_calibration.py --config configs/robot/calib_zed_ext1.yaml --init config   # refine the current one
+    python run_camera_calibration.py --config configs/robot/calib_zed_ext1.yaml \
+        --capture_from outputs/calibration/<run>/views.npz      # an earlier run's captures, new masks only
 """
 
 import sys

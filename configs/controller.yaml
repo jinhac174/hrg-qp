@@ -46,6 +46,22 @@ hrg:
   qp_eps_obs: 0.02         # m, hand spheres vs obstacles
   qp_eps_table: 0.005      # m, hand spheres vs table
   sep_rate_max: 0.25       # m/s, demanded separation rate when inside a margin
+  # The oriented reach (not in the paper; docs/superpowers/specs/2026-10-28-oriented-reach-design.md):
+  # every target pair has hand orientations in the object frame (one per admissible
+  # approach and finger order); the grasp is chosen in joint space (the arm motion to
+  # its IK configuration + a cost for leaving the object's preferred approach,
+  # configs/objects/*.yaml approach_axis), and eq. (11) also tracks the hand
+  # orientation and that configuration; the last approach_dist come straight in.
+  orient: true             # false: the paper's reach (fingertip points only)
+  rot_weight: 0.1          # alpha full weight: alpha(theta) |J_r,b qdot - w_des,b|^2 per vector pair
+  rot_gain: 2.0            # 1/s, w_des,b = R^T sat(rot_gain (R n_b) x n_t, rot_max)
+  rot_max: 1.0             # rad/s
+  rot_threshold: 30.0      # deg, alpha full above, linear to 0 below (2 sin 30 deg = the cap)
+  approach_dist: 0.10      # m, straight final approach along the target's approach axis
+  posture_weight: 0.05     # |qdot - posture_gain (q_grasp - q)|^2: the chosen grasp configuration
+  posture_gain: 1.0        # 1/s
+  select_w_pref: 2.0       # rad of joint motion per rad off the object's preferred approach
+  select_shortlist: 6      # new grasp candidates solved by IK per plan
 
 # Gamma(q) of eq. (11): robot vs environment (the scene's floor / wall_* geoms,
 # published by the env / run_hardware.py) and vs itself.
@@ -113,6 +129,7 @@ self_col_pairs:
 grasp:
   table_z: 0.0
   grasp_trigger_dist: 0.01 # m, both fingertips this close: close (paper: 1 cm sim, 1.5 cm robot)
+  grasp_trigger_rot: 10.0  # deg, and the hand this close to its target orientation (hrg.orient)
   grasp_force: 30.0        # N
   grasp_speed: 0.1         # m/s
   gripper_timeout: 3.0     # s
@@ -124,15 +141,44 @@ grasp:
   lift_pos_gain: 3.0       # 1/s
   lift_rot_gain: 2.0       # 1/s
   lift_rot_weight: 0.5
+  # After the lift: the held object back to its upright pose (object +z up; the
+  # smallest tilt, about the TCP, raised until it clears the table).
+  upright: true
+  upright_clearance: 0.03  # m, the upright object's lowest point above the table
+  upright_tol: 3.0         # deg
+  upright_timeout: 8.0     # s
+  held_eps: 0.02           # m, the held object's points above the table (lift, upright)
+  held_points: 64
+  payload_comp: true       # while holding: the object's weight (its config mass) added to g(q)
 home_gain: 1.0             # 1/s
+# Holding states (idle, close, reopen, hold): the joints where the state began,
+# hold_gain (q_hold - q), at most hold_vmax rad/s, through the planner.
+hold_gain: 5.0             # 1/s
+hold_vmax: 0.3             # rad/s
 
 # ---------------------------------------------------------------- low level (hrg/controller.py)
-# tau = kp (q_des - q) + kd (qdot_des - qdot) + g(q) + C(q, qdot) qdot, q_des += qdot_des dt
-kp: [600, 600, 600, 600, 250, 150, 50]
+# tau = kp (q_des - q) + kd (qdot_des - qdot) + g(q) + C(q, qdot) qdot + tau_f(qdot_des)
+# ref_mode step (paper Sec. II-D): q_des = q + qdot_des dt, so kp (q_des - q) is
+# ~1 % of the kd term: kp = 0, a damping (velocity) controller; the planner feeds
+# position back. ref_mode integral: q_des += qdot_des dt within max_ref_err (the
+# earlier variant; with kp [600, 600, 600, 600, 250, 150, 50] an integral term).
+ref_mode: step
+kp: [0, 0, 0, 0, 0, 0, 0]
 kd: [50, 50, 50, 20, 20, 20, 10]
 qd_filter: 0.25            # first-order filter on qdot_des per control tick
-max_ref_err: 0.05          # rad, |q_des - q| bound
-max_plan_age: 0.2          # s, no new plan for this long: qdot_des = 0
+max_ref_err: 0.05          # rad, |q_des - q| bound (ref_mode integral)
+max_plan_age: 0.2          # s, no new plan for this long: hold the joints (stale_hold_*)
+stale_hold_kp: [300, 300, 300, 300, 125, 75, 25]
+stale_hold_kd: [35, 35, 35, 15, 15, 15, 7]
+# Friction feed-forward on the commanded velocity (zero when the command is):
+# scale (coulomb tanh(qdot_des / v_smooth) + viscous qdot_des), capped at max.
+# Sim: the MuJoCo model's frictionloss / damping (assets/robot/fr3_robotiq_robot.xml).
+friction:
+  scale: 0.5
+  coulomb: [1.137, 1.137, 1.137, 1.137, 0.763, 0.44, 0.248]   # Nm
+  viscous: [0.21, 0.21, 0.21, 0.21, 0.21, 0.21, 0.21]          # Nm s/rad
+  v_smooth: 0.02           # rad/s
+  max: [1.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.3]                    # Nm
 width_stream_freq: 50.0    # Hz, move set-points to the gripper while reaching
 width_max_lead: 0.01       # m, w_ref stays this close to the measured width
 

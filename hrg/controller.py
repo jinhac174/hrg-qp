@@ -8,12 +8,27 @@ At the *measured* joints ``q`` and width ``w`` (the feedback of the method):
   ``wdot_des``. When both fingertips are within ``grasp_trigger_dist`` of
   their targets (paper: 1 cm in sim, 1.5 cm on the robot) the gripper closes
   (``close``).
+  With the oriented reach (``hrg.orient``) the hand must also be within
+  ``grasp_trigger_rot`` of its target orientation.
 * ``close``: wait for the gripper. Fingers stopped on something: ``lift``.
   Nothing between them: open again and reach again (``reopen``).
 * ``lift``: the TCP goes ``lift_height`` straight up (pose field through the
-  same QP), then ``hold``. The object lost (``is_grasped`` false) in ``lift``
-  or ``hold``: open and reach again.
-* ``idle`` / ``hold``: zero velocity (the joint reference stays where it is).
+  same QP), then ``upright`` (``grasp.upright``) or ``hold``.
+* ``upright``: the hand turns the held object back to its upright pose
+  (``ReachPlanner.upright_goal``: the smallest tilt, raised to clear the
+  table) until it is within ``upright_tol``, then ``hold``. During ``lift`` and ``upright`` the held object's points stay
+  ``held_eps`` above the table (QP rows), and its weight (``mass`` of its
+  config at its centre of mass) is added to ``g(q)`` (``payload_comp``). The
+  object's pose in the hand is taken when the gripper reports the grasp and
+  refreshed from the tracker whenever plausible (the grasped point still
+  between the pads); the turn is a feedback loop on the object's tilt, its
+  goal recomputed every plan, so an object that pivots in the fingers is
+  turned until it is upright. The object
+  lost (``is_grasped`` false) in ``lift``, ``upright`` or ``hold``: open and
+  reach again.
+* ``idle`` / ``close`` / ``reopen`` / ``hold``: hold the joints where the
+  state began (``hold_gain (q_hold - q)``, through the planner like every
+  other motion).
 * ``home`` (key ``h``): joint-space field to ``default_q_values`` through the
   same QP.
 
@@ -21,21 +36,25 @@ Control thread (``ctrl_freq``, 1 kHz)
 ------------------------------------
 Paper Sec. II-D: ``qdot_des`` is "integrated over one control interval to
 obtain the desired joint position" and tracked by "PD control with gravity
-compensation": every control tick
+compensation": every control tick (``ref_mode: step``, the paper)
 
-    q_des <- q_des + qdot_des dt
-    tau    = Kp (q_des - q) + Kd (qdot_des - qdot) + g(q) + C(q, qdot) qdot
+    q_des  = q + qdot_des dt
+    tau    = Kp (q_des - q) + Kd (qdot_des - qdot) + g(q) + C(q, qdot) qdot + tau_f(qdot_des)
 
 (sent as ``joint_ctrl_t``; the sim / ``run_hardware.py`` evaluates the PD at
-1 kHz with the latest measurement). The desired position is the running
-integral of the commands. Restarting it from the measured ``q`` every tick
-would leave ``Kp (q_des - q) = Kp qdot_des dt`` (~0.02 Nm at 1 kHz), a pure
-damper that the FR3's joint friction (0.2-1 Nm) stops at low commanded speeds.
-``q_des`` stays within ``max_ref_err`` of ``q`` (no wind-up when the arm is
-blocked or pushed); since the QP is solved at the measured state, a push or a
-lag is fed back at the next plan. ``qdot_des`` passes a first-order filter
-(``qd_filter``: the plan changes in steps at 100 Hz, the FR3 rejects torque
-steps) and drops to zero if no plan arrived for ``max_plan_age`` s.
+1 kHz with the latest measurement). ``Kp (q_des - q) = Kp dt qdot_des`` then
+only adds ~1 % to the Kd term, so ``kp`` is 0: a damping (velocity)
+controller, and position is fed back by the planner (the QP is solved at the
+measured state every 10 ms; the holding states run a joint field).
+``ref_mode: integral`` is the earlier variant, ``q_des <- q_des + qdot_des
+dt`` within ``max_ref_err`` of ``q`` (with ``kp`` > 0 an integral of the
+velocity error). ``tau_f`` is the friction feed-forward on the *commanded*
+velocity, ``scale (coulomb tanh(qdot_des / v_smooth) + viscous qdot_des)``,
+capped at ``max`` (``friction:``; on the robot from
+``scripts/robot/identify_friction.py``). ``qdot_des`` passes a first-order
+filter (``qd_filter``: the plan changes in steps at 100 Hz, the FR3 rejects
+torque steps). If no plan arrived for ``max_plan_age`` s the joints are held
+where they were (``stale_hold_kp`` / ``kd``) until plans come again.
 
 The gripper is position-servoed (the Robotiq, and its sim): ``wdot_des`` is
 realised the same way, as a set-point ``w_ref += wdot_des dt`` kept within
@@ -66,6 +85,8 @@ from fr3.data_type.basic_types.JointMeasData import JointMeasData
 from fr3.data_type.basic_types.NamedVecListData import NamedVecListData
 from fr3.data_type.basic_types.SE3PoseData import SE3PoseData
 from hrg import obstacles as obstacle_msg
+from fr3.utils.lie.so3 import skew
+from hrg.friction import friction_torque
 from hrg.hand import MAX_WIDTH, MAX_WIDTH_RATE, N_ARM
 from hrg.objects import GraspObject
 from hrg.paths import resolve
@@ -97,7 +118,8 @@ class HRGController(BaseController):
         self._obj = GraspObject(config["object_config"])
         self._params = HRGParams.from_config(config["hrg"])
         self._planner = ReachPlanner(
-            self._params, self._robot, FingertipTargets.load(resolve(self._obj.cfg["fingertip_targets"])),
+            self._params, self._robot,
+            FingertipTargets.load(resolve(self._obj.cfg["fingertip_targets"]), self._obj.cfg.get("approach_axis")),
             sdf_from_config(self._obj.cfg["sdf"]), table_z=float(g["table_z"]),
         )
         self._q_home = np.asarray(config["default_q_values"], dtype=float)
@@ -114,11 +136,34 @@ class HRGController(BaseController):
         self._lift_cfg = dict(v_max=float(g["lift_speed"]), w_max=float(g["lift_angular_speed"]),
                               pos_gain=float(g["lift_pos_gain"]), rot_gain=float(g["lift_rot_gain"]),
                               rot_weight=float(g["lift_rot_weight"]))
+        self._trigger_rot = np.radians(float(g.get("grasp_trigger_rot", 10.0)))
+        self._upright = bool(g.get("upright", True))
+        self._upright_clearance = float(g.get("upright_clearance", 0.03))
+        self._upright_tol = np.radians(float(g.get("upright_tol", 3.0)))
+        self._upright_timeout = float(g.get("upright_timeout", 8.0))
+        self._held_eps = float(g.get("held_eps", 0.02))
+        self._held_pts = self._held_points(int(g.get("held_points", 64)))
+        self._payload_comp = bool(g.get("payload_comp", True))
+        self._obj_com = self._object_com()
+        self._held = None  # (mass, centre of mass in the TCP frame) while holding: added to g(q)
         self._home_gain = float(config["home_gain"])
+        self._hold_gain = float(config.get("hold_gain", 5.0))
+        self._hold_vmax = float(config.get("hold_vmax", 0.3))
 
         # Low level
+        self._ref_mode = str(config.get("ref_mode", "step"))
+        if self._ref_mode not in ("step", "integral"):
+            raise ValueError(f"ref_mode must be 'step' or 'integral', got {self._ref_mode!r}")
         self._kp = np.asarray(config["kp"], dtype=float)
         self._kd = np.asarray(config["kd"], dtype=float)
+        self._stale_kp = np.asarray(config.get("stale_hold_kp", [300, 300, 300, 300, 125, 75, 25]), dtype=float)
+        self._stale_kd = np.asarray(config.get("stale_hold_kd", [35, 35, 35, 15, 15, 15, 7]), dtype=float)
+        fr = config.get("friction", None) or {}
+        self._fr_scale = float(fr.get("scale", 0.0))
+        self._fr_coulomb = np.asarray(fr.get("coulomb", [0.0] * N_ARM), dtype=float)
+        self._fr_viscous = np.asarray(fr.get("viscous", [0.0] * N_ARM), dtype=float)
+        self._fr_vs = float(fr.get("v_smooth", 0.02))
+        self._fr_max = np.asarray(fr.get("max", [1.0] * N_ARM), dtype=float)
         self._qd_filter = float(config["qd_filter"])
         self._max_ref_err = float(config["max_ref_err"])
         self._max_plan_age = float(config["max_plan_age"])
@@ -151,6 +196,10 @@ class HRGController(BaseController):
         self._t_start = time.time()
         self._T_lift = None
         self._lift_t0 = 0.0
+        self._T_tcp_obj = None  # the object in the hand, recorded when the gripper closes
+        self._grasp_point = np.zeros(3)  # the grasped contact pair's midpoint, object frame
+        self._no_target = False  # reported that no target is reachable (once)
+        self._q_hold = None  # joints the holding states keep
         self._wait_seq = None
         self._wait_t0 = 0.0
         self._plan_times: list[float] = []
@@ -168,6 +217,7 @@ class HRGController(BaseController):
         self._wd_des = 0.0
         self._qd_filt = np.zeros(N_ARM)
         self._q_ref = None
+        self._q_stale = None
         self._plan_stamp = -np.inf
         self._w_ref = None
         self._w_last_sent = None
@@ -255,10 +305,12 @@ class HRGController(BaseController):
             with self._fsm_lock:
                 self._planner.reset()
                 self._t_start = time.time()
+                self._held = None  # the reach opens the gripper
                 self._enter("reach")
             self._streaming = True
         elif key == "x":
             self._streaming = False
+            self._held = None
             self._gripper(GripperCmdData.MOVE, MAX_WIDTH)
             with self._fsm_lock:
                 self._enter("idle")
@@ -272,7 +324,64 @@ class HRGController(BaseController):
     def _enter(self, state: str) -> None:
         if state != self._state:
             print(f"[HRG] {self._state} -> {state}")
+            self._q_hold = None  # a holding state holds where it begins
         self._state = state
+
+    def _held_points(self, n: int) -> np.ndarray:
+        """``n`` points of the object's surface (object frame, farthest-point
+        sampled): what is kept above the table while it is held."""
+        sdf = self._obj.cfg.get("sdf", {})
+        if str(sdf.get("type", "")) == "point_cloud":
+            P = np.load(resolve(sdf["path"]))[:, :3]
+        else:
+            P = np.asarray(self._obj.mesh.vertices, dtype=float)
+        if len(P) <= n:
+            return P.copy()
+        idx = [int(np.argmin(P[:, 2]))]
+        d = np.linalg.norm(P - P[idx[0]], axis=1)
+        for _ in range(n - 1):
+            idx.append(int(np.argmax(d)))
+            d = np.minimum(d, np.linalg.norm(P - P[idx[-1]], axis=1))
+        return P[idx]
+
+    def _object_com(self) -> np.ndarray:
+        """The object's centre of mass, object frame (the mean of its evenly
+        sampled surface: a thin-walled object's)."""
+        sdf = self._obj.cfg.get("sdf", {})
+        if str(sdf.get("type", "")) == "point_cloud":
+            return np.load(resolve(sdf["path"]))[:, :3].mean(axis=0)
+        return np.asarray(self._obj.mesh.center_mass, dtype=float)
+
+    def _set_held(self) -> None:
+        """Holding the object: its weight goes into the gravity feed-forward."""
+        if self._payload_comp and self._T_tcp_obj is not None:
+            self._held = (self._obj.mass, self._T_tcp_obj[:3, :3] @ self._obj_com + self._T_tcp_obj[:3, 3])
+
+    def _payload_torque(self, q) -> np.ndarray:
+        """``J_p(c)^T m g`` for the held object at ``c`` (TCP frame): what
+        holds it up (``None`` held: zeros)."""
+        held = self._held
+        if held is None:
+            return np.zeros(N_ARM)
+        m, c = held
+        T = self._robot.pose(q, self._pin_ctrl)
+        J = self._robot.jacobian(q, self._pin_ctrl)
+        Jp = J[3:] - skew(T[:3, :3] @ c) @ J[:3]
+        return Jp.T @ np.array([0.0, 0.0, m * 9.81])
+
+    def _hold_plan(self, q) -> Plan:
+        """Keep the joints where the holding state began (through the
+        planner: with ``kp = 0`` nothing else holds the arm)."""
+        if self._q_hold is None:
+            self._q_hold = q.copy()
+        qd = np.clip(self._hold_gain * (self._q_hold - q), -self._hold_vmax, self._hold_vmax)
+        return Plan(qd)
+
+    def _held_tcp(self):
+        """The held object's points in the TCP frame (None before a grasp)."""
+        if self._T_tcp_obj is None:
+            return None
+        return self._held_pts @ self._T_tcp_obj[:3, :3].T + self._T_tcp_obj[:3, 3]
 
     # ------------------------------------------------------------ gripper
     def _send_gripper(self, mode: int, width: float, speed: float, force: float, eps_in: float, eps_out: float) -> int:
@@ -312,6 +421,7 @@ class HRGController(BaseController):
         return None
 
     def _reopen(self) -> None:
+        self._held = None
         with self._gripper_lock:
             self._streaming = False
         self._wait_for(self._gripper(GripperCmdData.MOVE, MAX_WIDTH))
@@ -337,18 +447,20 @@ class HRGController(BaseController):
     def _plan(self) -> Plan:
         q, w, T_obj, obstacles, gs = self._snapshot()
         w = MAX_WIDTH if w is None else w
-        hold = Plan(np.zeros(N_ARM))
         with self._fsm_lock:
             state = self._state
         if state == "reach":  # planned outside the lock (the keyboard takes it)
-            return hold if T_obj is None else self._reach(q, w, T_obj, obstacles)
+            return self._hold_plan(q) if T_obj is None else self._reach(q, w, T_obj, obstacles)
         with self._fsm_lock:
             if state != self._state:  # changed by a key meanwhile
-                return hold
+                return self._hold_plan(q)
             if state == "close":
                 done = self._gripper_done(gs)
                 if done:
                     self._T_lift = self._planner.tcp_pose(q)
+                    if T_obj is not None:  # the object as it sits in the closed fingers
+                        self._T_tcp_obj = np.linalg.inv(self._T_lift) @ T_obj
+                    self._set_held()
                     self._T_lift[2, 3] += self._lift_height
                     self._lift_t0 = time.time()
                     print(f"[HRG] Grasped after {time.time() - self._t_start:.1f} s; lifting.")
@@ -356,53 +468,112 @@ class HRGController(BaseController):
                 elif done is False:
                     print("[HRG] Grasp failed (nothing between the fingers): opening, reaching again.")
                     self._reopen()
-                return hold
-            if state in ("lift", "hold"):
+                return self._hold_plan(q)
+            if state in ("lift", "upright", "hold"):
                 if gs is not None and not gs.is_grasped:
                     print("[HRG] Object lost: opening, reaching again.")
                     self._reopen()
-                    return hold
+                    return self._hold_plan(q)
                 if state == "hold":
-                    return hold
+                    return self._hold_plan(q)
                 T_tcp = self._planner.tcp_pose(q)
-                if (np.linalg.norm(T_tcp[:3, 3] - self._T_lift[:3, 3]) <= self._lift_tol
-                        or time.time() - self._lift_t0 > self._lift_timeout):
-                    print(f"[HRG] Lifted ({time.time() - self._t_start:.1f} s). Press x to release.")
+                if state == "lift":
+                    if (np.linalg.norm(T_tcp[:3, 3] - self._T_lift[:3, 3]) <= self._lift_tol
+                            or time.time() - self._lift_t0 > self._lift_timeout):
+                        return self._after_lift(q, T_tcp, T_obj)
+                    return Plan(self._planner.lift_step(q, w, self._T_lift, **self._lift_cfg,
+                                                        held=self._held_tcp(), held_eps=self._held_eps))
+                # upright: a feedback loop on the object's tilt in the hand (refreshed by the
+                # tracker when plausible), the goal recomputed every plan
+                self._refresh_in_hand(T_tcp, T_obj)
+                T_up, tilt = self._planner.upright_goal(T_tcp, self._T_tcp_obj, self._held_pts,
+                                                        self._upright_clearance, self._T_lift[:3, 3])
+                if ((tilt <= self._upright_tol and np.linalg.norm(T_tcp[:3, 3] - T_up[:3, 3]) <= self._lift_tol)
+                        or time.time() - self._lift_t0 > self._upright_timeout):
+                    print(f"[HRG] Upright ({np.degrees(tilt):.1f} deg, {time.time() - self._t_start:.1f} s). "
+                          "Press x to release.")
                     self._enter("hold")
-                    return hold
-                return Plan(self._planner.lift_step(q, w, self._T_lift, **self._lift_cfg))
+                    return self._hold_plan(q)
+                return Plan(self._planner.lift_step(q, w, T_up, **self._lift_cfg,
+                                                    held=self._held_tcp(), held_eps=self._held_eps))
             if state == "reopen":
                 if self._gripper_done(gs) is not None:
                     self._planner.reset()
                     self._enter("reach")
                     self._streaming = True
-                return hold
+                return self._hold_plan(q)
             if state == "home":
                 return Plan(self._planner.home_step(q, w, self._q_home, self._home_gain))
-        return hold
+        return self._hold_plan(q)
+
+    def _refresh_in_hand(self, T_tcp, T_obj) -> bool:
+        """Take the object's pose in the hand from the tracker if it is
+        plausible: the grasped point (between the pads) within 2 cm of where
+        it was, the object turned by at most 45 deg (it may pivot about the
+        grasp; the tracker may also lose an object held in the fingers, the
+        hand cannot). True if refreshed."""
+        if T_obj is None or self._T_tcp_obj is None:
+            return False
+        T_live = np.linalg.inv(T_tcp) @ T_obj
+        d_rot = np.linalg.norm(Rotation.from_matrix(T_live[:3, :3] @ self._T_tcp_obj[:3, :3].T).as_rotvec())
+        g = self._grasp_point
+        d_pos = np.linalg.norm((T_live[:3, :3] - self._T_tcp_obj[:3, :3]) @ g + T_live[:3, 3] - self._T_tcp_obj[:3, 3])
+        if d_rot > np.radians(45.0) or d_pos > 0.02:
+            return False
+        self._T_tcp_obj = T_live
+        self._set_held()
+        return True
+
+    def _after_lift(self, q, T_tcp, T_obj) -> Plan:
+        """Lifted: turn the object upright (``upright``) or hold."""
+        self._refresh_in_hand(T_tcp, T_obj)
+        tilt = 0.0
+        if self._upright and self._T_tcp_obj is not None:
+            T_up, tilt = self._planner.upright_goal(T_tcp, self._T_tcp_obj, self._held_pts, self._upright_clearance)
+        if tilt <= self._upright_tol:
+            print(f"[HRG] Lifted ({time.time() - self._t_start:.1f} s). Press x to release.")
+            self._enter("hold")
+            return self._hold_plan(q)
+        print(f"[HRG] Lifted ({time.time() - self._t_start:.1f} s); turning the object upright "
+              f"({np.degrees(tilt):.0f} deg).")
+        self._T_lift, self._lift_t0 = T_up, time.time()  # its position stays the goal's
+        self._enter("upright")
+        return self._hold_plan(q)
 
     def _reach(self, q, w, T_obj, obstacles) -> Plan:
         t0 = time.perf_counter()
         r = self._planner.step(q, w, T_obj, obstacles)
         if r is None:
-            print("[HRG] No reachable fingertip target for this object pose.")
-            return Plan(np.zeros(N_ARM))
+            if not self._no_target:
+                print("[HRG] No reachable fingertip target for this object pose (holding).")
+            self._no_target = True
+            return self._hold_plan(q)
+        self._no_target = False
         if not r.qp_ok:
             print("[HRG] QP failed: holding this plan.")
         err = np.linalg.norm(r.x - r.x_tgt, axis=1)
-        if np.all(err <= self._trigger):
+        aligned = r.R_star is None or r.info["rot_err"] <= self._trigger_rot
+        if np.all(err <= self._trigger) and aligned:
             with self._fsm_lock, self._gripper_lock:
                 if self._state != "reach":  # a key meanwhile
-                    return Plan(np.zeros(N_ARM))
+                    return self._hold_plan(q)
                 self._streaming = False
+                # The object in the hand, for the lift (live tracking is
+                # unreliable once the gripper hides it).
+                self._T_tcp_obj = np.linalg.inv(self._planner.tcp_pose(q)) @ T_obj
+                tg = self._planner.targets
+                self._grasp_point = 0.5 * (tg.p1[r.target] + tg.p2[r.target])  # object frame
                 self._wait_for(self._grasp(r.contact_width, float(np.linalg.norm(r.x_tgt[1] - r.x_tgt[0]))))
                 self._enter("close")
             ts = np.asarray(self._plan_times or [np.nan]) * 1e3
-            print(f"[HRG] Fingertips at the targets (err {err[0] * 1e3:.1f} / {err[1] * 1e3:.1f} mm): "
+            rot = "" if r.R_star is None else f", hand {np.degrees(r.info['rot_err']):.1f} deg off"
+            print(f"[HRG] Fingertips at the targets (err {err[0] * 1e3:.1f} / {err[1] * 1e3:.1f} mm{rot}): "
                   f"grasping at {r.contact_width * 1e3:.1f} mm, {self._grasp_force:.0f} N")
             print(f"[HRG] plan time {np.median(ts):.1f} ms median, {np.max(ts):.1f} ms max over the reach")
             self._plan_times.clear()
-            return Plan(np.zeros(N_ARM), reach=r)
+            plan = self._hold_plan(q)  # (the state is close now: holds from here)
+            plan.reach = r
+            return plan
         self._plan_times.append(time.perf_counter() - t0)
         if len(self._plan_times) >= 300:
             ts = np.asarray(self._plan_times) * 1e3
@@ -410,6 +581,7 @@ class HRGController(BaseController):
                   f"h = {r.info['h'] * 100:.1f} cm, alpha {r.info['alpha']:.2f}, beta {r.info['beta']:.2f}, "
                   f"{r.info['n_rows']} constraint rows{binding_text(r.info['binding'])}")
             self._plan_times.clear()
+        self._q_hold = None  # moving: a later hold starts where it is then
         return Plan(r.qd, r.wd, reach=r)
 
     # ------------------------------------------------------------ control thread
@@ -430,15 +602,28 @@ class HRGController(BaseController):
             gs = self._gripper_state
         fresh = self._cur_time - self._plan_stamp <= self._max_plan_age
 
-        # Arm: q_des += qdot_des dt; PD + gravity / Coriolis compensation.
+        # Arm: q_des from qdot_des (ref_mode); PD + gravity / Coriolis + friction.
         a = float(np.clip(self._qd_filter, 0.0, 1.0))
         self._qd_filt = a * (self._qd_des if fresh else 0.0) + (1.0 - a) * self._qd_filt
-        if self._q_ref is None:
-            self._q_ref = q.copy()
-        self._q_ref = np.clip(self._q_ref + self._qd_filt * self._ctrl_dt, q - self._max_ref_err, q + self._max_ref_err)
+        tau_ff = (self._robot.gravity_coriolis(q, qd, self._pin_ctrl) + self.friction(self._qd_filt)
+                  + self._payload_torque(q))
+        kp, kd = self._kp, self._kd
+        if not fresh:  # no plan: hold the joints where the plans stopped
+            if self._q_stale is None:
+                self._q_stale = q.copy()
+            self._q_ref = self._q_stale.copy()
+            kp, kd = self._stale_kp, self._stale_kd
+        elif self._ref_mode == "step":  # the paper: one control interval from the measured q
+            self._q_stale = None
+            self._q_ref = q + self._qd_filt * self._ctrl_dt
+        else:  # running integral of the commands
+            self._q_stale = None
+            if self._q_ref is None:
+                self._q_ref = q.copy()
+            self._q_ref = np.clip(self._q_ref + self._qd_filt * self._ctrl_dt,
+                                  q - self._max_ref_err, q + self._max_ref_err)
         cmd = JointCtrlData(num_joints=N_ARM)
-        cmd.set_data(self._cur_time, self._q_ref.copy(), self._qd_filt.copy(),
-                     self._robot.gravity_coriolis(q, qd, self._pin_ctrl), self._kp, self._kd)
+        cmd.set_data(self._cur_time, self._q_ref.copy(), self._qd_filt.copy(), tau_ff, kp, kd)
         self.ctrl_pub_que.put(cmd)
 
         # Gripper: w_ref += wdot_des dt, streamed as move set-points.
@@ -458,6 +643,11 @@ class HRGController(BaseController):
                     return
                 self._send_gripper(GripperCmdData.MOVE, self._w_ref, MAX_WIDTH_RATE, 0.0, 0.01, 0.01)
             self._w_last_sent, self._w_last_sent_t = self._w_ref, self._cur_time
+
+    def friction(self, qd_cmd: np.ndarray) -> np.ndarray:
+        """Friction feed-forward on the commanded joint velocities
+        (``hrg.friction``): zero at a zero command."""
+        return friction_torque(qd_cmd, self._fr_scale, self._fr_coulomb, self._fr_viscous, self._fr_vs, self._fr_max)
 
     # ------------------------------------------------------------ viz
     # Fingertip names: thumb = fingertip 1 (left pad), index = fingertip 2.
