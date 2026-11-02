@@ -5,7 +5,7 @@ by `run_hardware.py`, which talks to the FR3 (libfranka via panda-py) and the
 2F-85 (Modbus over RS-485) and publishes **the same LCM channels**. The object
 pose comes from FoundationPose instead of the simulator. The controller is the
 same; `configs/robot/controller.yaml` on top of `configs/controller.yaml` sets
-real-time mode, the paper's 1.5 cm trigger and the real cell's walls.
+real-time mode, the 1 cm trigger and the real cell's walls.
 
 ```
 run_sensors.py (ZED)  --zed_ext1-->  run_perception.py (FoundationPose + SAM2, GPU)
@@ -227,6 +227,20 @@ follow it when moved.
 
 ## 4. Grasping
 
+Every speed, limit and gain is in the config files: the commands below run as they are, at full
+speed, with no overrides (`configs/controller.yaml`, then `configs/robot/controller.yaml` on top).
+The smooth-motion tuning (docs/method.md, "Smoothness") has been run in simulation and through
+`run_hardware.py`'s fake backend, not yet on the FR3 itself, so keep the user stop in hand on the
+first runs, and record the bus:
+
+```bash
+lcm-logger -c "franka_.*" outputs/logs/bus_$(date +%Y%m%d_%H%M%S).lcm
+```
+
+What to look for: the arm rises in a smooth bell of speed after the grasp and stops at its height
+without coming back; `plan time ... median` printed after each reach stays well under 10 ms. On a stop
+(red lights) `run_hardware.py` saves `outputs/logs/reflex_<time>.npz`; keep it with the bus log.
+
 ```bash
 python run_hardware.py --config configs/robot/hardware.yaml
 python run_controller.py --config configs/controller.yaml configs/robot/controller.yaml \
@@ -275,9 +289,9 @@ Objects for the real experiments (paper Sec. III-B): `blue_bowl`, `red_cup`,
   of the hand chasing a moved object, and of the lift; docs/method.md "Speed").
   The QP plans within 0.8 of the FR3's own joint velocity limits, which fall
   toward the ends of each joint's range (`fr3/robot_platform/fr3_limits.py`),
-  and at its 10 rad/s² acceleration limit; `run_hardware.py` brakes above 0.9
+  and at 8 rad/s² (the FR3's limit is 10); `run_hardware.py` brakes above 0.9
   of those limits. Each plan's torque (`M a + g + C v`, the feed-forward)
-  stays within 0.8 of the FR3's torque and torque rate (87 / 12 Nm,
+  stays within 0.7 of the FR3's torque and torque rate (87 / 12 Nm,
   1000 Nm/s), and the controller ramps it at that rate
   (`joint_torque_limit_scale`). (2026-11-02: chasing a bowl moved by hand,
   the hand went to 1.1 m/s and the robot stopped with
@@ -289,9 +303,14 @@ Objects for the real experiments (paper Sec. III-B): `blue_bowl`, `red_cup`,
   power limit: the plans switched accelerations faster than the robot's
   torque follows (1–7 ms dead time, 12–38 ms lag, from the flight recorder),
   and the held bowl's table rows kicked the arm at the grasp. Now each
-  joint's acceleration changes at most 300 rad/s³ (`joint_jerk_limit`), the
+  joint's acceleration changes at most 200 rad/s³ (`joint_jerk_limit`), the
   held rows never demand separation, and the lift goes at 0.5 m/s. The
-  simulation has that torque response, `configs/sim/env.yaml`.)
+  simulation has that torque response, `configs/sim/env.yaml`. The source of
+  that oscillation was found afterwards: docs/method.md, "Smoothness".)
+* **Plan time.** The controller prints it after every reach. The median must
+  stay well under the 10 ms plan period: at 23 ms (a machine shared with five
+  simulations) the lift's wrist torque request reached 1.0-1.6 of the limit.
+  If FoundationPose's GPU load or anything else pushes it up, fix that first.
   What to watch: the FR3's collision reflex
   (external-torque estimate; model errors grow with acceleration;
   thresholds in `hardware.yaml`) and the gripper stream above.

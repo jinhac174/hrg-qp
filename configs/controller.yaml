@@ -71,6 +71,24 @@ hrg:
   # + this on each side instead of fully, so the fingers straddle the object as they come in
   # and the width never limits the straight approach (0: the paper's w_nominal throughout).
   preshape_margin: 0.01    # m
+  # Smoothness (docs/method.md, "Smoothness"; hrg/profile.py). What the references may do: the
+  # fingertips' velocity moves toward the field's within task_accel / task_jerk (below 6 m/s^2 the
+  # hand cuts the corners of the path around the object and the reach takes twice as long), the
+  # hand's turn and the joints' posture field likewise.
+  task_accel: 6.5          # m/s^2
+  task_jerk: 150.0         # m/s^3
+  rot_accel: 15.0          # rad/s^2
+  rot_jerk: 300.0          # rad/s^3
+  posture_vmax: 0.9        # rad/s (norm)
+  posture_accel: 5.0       # rad/s^2
+  posture_jerk: 80.0       # rad/s^3
+  # The arm's self-motion (ReachPlanner._null_task): priced, or the QP pours motion into it
+  # whenever a row binds. null_lambda: singular values of the Jacobian below this count as
+  # self-motion. Above ~0.06 it starts to price real hand motion too (the weakest is ~0.18):
+  # the lift then stalls short of its goal.
+  null_weight: 1.0
+  null_gain: 2.0           # 1/s, back to the configuration at the grasp (after the grasp)
+  null_lambda: 0.03
 
 # Gamma(q) of eq. (11): robot vs environment (the scene's floor / wall_* geoms,
 # published by the env / run_hardware.py) and vs itself.
@@ -82,19 +100,19 @@ joint_velocity_limit: [2, 2, 2, 2, 2.5, 2.5, 2.5]           # rad/s (hardware.ya
 joint_velocity_limit_scale: 0.8
 # The QP changes its velocity by at most these per plan period (|z - z_prev| <= a dt): the plan is
 # a profile the arm can follow, and the low level feeds the acceleration forward (hrg/lowlevel.py).
-joint_acceleration_limit: [10, 10, 10, 10, 10, 10, 10]    # rad/s^2, the FR3's limits (FCI docs, libfranka)
+joint_acceleration_limit: [8, 8, 8, 8, 8, 8, 8]    # rad/s^2, within the FR3's 10 (FCI docs, libfranka): the arm follows with an error
 # ... and the torque each plan asks of the arm, M(q) a + g(q) + C(q, v) v (the low level's feed-forward),
 # within this fraction of the FR3's torque (87 / 12 Nm) and torque rate (1000 Nm/s: per plan period,
-# M (a - a_prev) <= 8 Nm), the rest left to the Kd feedback and a held object. Faster changes reach the
+# M (a - a_prev) <= 7 Nm), the rest left to the Kd feedback and a held object. Faster changes reach the
 # robot rate-limited, late, and with them the Kd term: the arm lagged its plan by 50 ms, overshot the
 # lift by 2 cm and joints 1 / 3 shook until a reflex (2026-11-02, outputs/logs/bus_20261102_17*.lcm).
-joint_torque_limit_scale: 0.8
+joint_torque_limit_scale: 0.7
 # ... and each joint's acceleration changes by at most this per second (rad/s^3, per plan period
-# 3 rad/s^2): the FR3's torque follows its command 15-40 ms late (flight recorder, 2026-11-02),
-# so an acceleration reaches the joint over ~30 ms (10 rad/s^2 / 30 ms ~ 300 rad/s^3). Plans that
+# 2 rad/s^2): the FR3's torque follows its command 15-40 ms late (flight recorder, 2026-11-02),
+# so an acceleration reaches the joint over ~30 ms, and more than ~300 rad/s^3 is not followed. Plans that
 # switched +-10 rad/s^2 from one period to the next kicked the light joint 1 / 3 counter-motion
 # (0.2 kg m^2) into an 8 Hz oscillation on the robot.
-joint_jerk_limit: [300, 300, 300, 300, 300, 300, 300]
+joint_jerk_limit: [200, 200, 200, 200, 200, 200, 200]
 width_acceleration_limit: 2.0                              # m/s^2, the 2F-85's set-point response
 env_col_margin: 0.02
 self_col_margin: 0.02
@@ -165,9 +183,16 @@ grasp:
   gripper_timeout: 3.0     # s
   lift_height: 0.15        # m
   lift_tol: 0.01           # m
-  lift_timeout: 3.0        # s (a 15 cm lift takes ~0.4 s; near the reach limit it may not finish)
-  lift_speed: 0.5          # m/s, the reach's top speed: the arm brakes ~25 ms late (the torque lag), the hand overshoots by ~v x lag
+  lift_timeout: 3.0        # s (a 15 cm lift takes ~0.6 s; near the reach limit it may not finish)
+  # The lift is a minimum-jerk motion within these (hrg/profile.py), 0.6 s for 15 cm at 0.5 m/s,
+  # peak hand acceleration ~2.4 m/s^2, its error fed back through the pose field.
+  lift_speed: 0.5          # m/s
+  lift_accel: 3.0          # m/s^2
+  lift_jerk: 40.0          # m/s^3
   lift_angular_speed: 2.0  # rad/s
+  lift_angular_accel: 8.0  # rad/s^2
+  lift_angular_jerk: 100.0 # rad/s^3
+  lift_lag: 0.04           # s, how late the arm follows: the error is read from where the reference was then
   lift_pos_gain: 8.0       # 1/s
   lift_rot_gain: 5.0       # 1/s
   lift_rot_weight: 0.5
@@ -180,6 +205,7 @@ grasp:
   held_eps: 0.02           # m, the held object's points above the table (lift, upright)
   held_points: 64
   payload_comp: true       # while holding: the object's weight (its config mass) added to g(q)
+  payload_ramp: 0.3        # s, it fades in and out over this
 home_gain: 2.0             # 1/s
 # Holding states (idle, close, reopen, hold): the joints where the state began,
 # hold_gain (q_hold - q), at most hold_vmax rad/s, through the planner.
@@ -197,7 +223,12 @@ hold_vmax: 1.0             # rad/s
 # (the earlier variant; with kp [600, 600, 600, 600, 250, 150, 50] an integral term).
 ref_mode: step
 kp: [0, 0, 0, 0, 0, 0, 0]
-kd: [50, 50, 50, 20, 20, 20, 10]
+# Joints 1 and 3 turning against each other are the arm's lightest motion, and joint 1's torque is
+# the latest: with 50 on both that mode has a damping ratio of 0.02-0.09 near 15 Hz at the poses used
+# (unstable at 1 % of random poses; torque lags of configs/sim/env.yaml, the model's rotor inertia).
+# 30 / 35: 0.12-0.18, none unstable. The feed-forward, not Kd, carries the motion. Joint 2 stays
+# stiff: it hardly enters that mode and it carries the lift.
+kd: [30, 50, 35, 20, 20, 20, 10]
 inertia_ff: true
 max_ref_err: 0.05          # rad, |q_des - q| bound (ref_mode integral)
 max_plan_age: 0.2          # s, no new plan for this long: hold the joints (stale_hold_*)
@@ -210,7 +241,7 @@ friction:
   scale: 0.5
   coulomb: [1.137, 1.137, 1.137, 1.137, 0.763, 0.44, 0.248]   # Nm
   viscous: [0.21, 0.21, 0.21, 0.21, 0.21, 0.21, 0.21]          # Nm s/rad
-  v_smooth: 0.02           # rad/s
+  v_smooth: 0.05           # rad/s (0.02 is a slope of 30 Nm s/rad at zero: it chatters as the command crosses zero at a halt)
   max: [1.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.3]                    # Nm
 # The object pose carried forward at its estimated velocity between perception frames (30 Hz
 # sim, ~24 Hz FoundationPose): a moving object's targets then move smoothly at the plan rate

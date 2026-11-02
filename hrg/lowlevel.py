@@ -52,16 +52,25 @@ from hrg.hand import MAX_WIDTH
 
 class VelocityRamp:
     """The commanded velocity between plans: a linear ramp from the value at
-    the moment a plan arrived to the plan's value, over ``plan_dt``; held
-    once reached (a late plan). ``at(t)`` gives ``(v, a)``."""
+    the moment a plan arrived to the plan's value, over the plans' measured
+    period (``plan_dt`` at best); held once reached (a late plan). ``at(t)``
+    gives ``(v, a)``. Over ``plan_dt`` alone, every plan later than that ended
+    its ramp early: the acceleration, and with it ``M(q) a``, dropped to zero
+    until the plan came and returned steeper, a torque ripple at the plan rate
+    whenever the machine is busy (the plan takes 7-8 ms of its 10)."""
 
-    def __init__(self, n: int, plan_dt: float):
+    def __init__(self, n: int, plan_dt: float, period_gain: float = 0.2):
         self.plan_dt = max(float(plan_dt), 1e-4)
+        self.period = self.plan_dt
+        self.period_gain = float(period_gain)
         self._v_from = np.zeros(n)
         self._v_to = np.zeros(n)
         self._t0 = None
 
     def new_plan(self, v_to, t: float) -> None:
+        if self._t0 is not None and t - self._t0 < 3.0 * self.plan_dt:  # (longer: a stall, not a period)
+            self.period += self.period_gain * (t - self._t0 - self.period)
+            self.period = float(np.clip(self.period, self.plan_dt, 2.0 * self.plan_dt))
         self._v_from = self.at(t)[0]
         self._v_to = np.asarray(v_to, dtype=float).copy()
         self._t0 = float(t)
@@ -69,11 +78,11 @@ class VelocityRamp:
     def at(self, t: float):
         if self._t0 is None:
             return self._v_to.copy(), np.zeros_like(self._v_to)
-        s = (float(t) - self._t0) / self.plan_dt
+        s = (float(t) - self._t0) / self.period
         if s >= 1.0:
             return self._v_to.copy(), np.zeros_like(self._v_to)
         s = max(s, 0.0)
-        return self._v_from + s * (self._v_to - self._v_from), (self._v_to - self._v_from) / self.plan_dt
+        return self._v_from + s * (self._v_to - self._v_from), (self._v_to - self._v_from) / self.period
 
     def stop(self, t: float) -> None:
         """Plans stopped: the command is zero from here (the hold takes over)."""

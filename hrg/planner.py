@@ -39,7 +39,10 @@ The controller (``hrg.controller``) calls it at 100 Hz at the measured state;
 ``scripts/rollout.py`` calls it in a loop with perfect tracking.
 
 ``lift_step`` / ``home_step``: after the grasp / on the home key, the same QP
-with a TCP pose field / a joint-space field as the task. ``lift_step`` keeps
+with a minimum-jerk pose reference (``hrg.profile``) / a joint-space field as
+the task. Every reference moves at a bounded acceleration, and the arm's
+self-motion is a task of its own (``_null_task``; docs/method.md,
+"Smoothness"). ``lift_step`` keeps
 a held object's points above the table (``held``); ``upright_goal`` is the
 hand pose that puts the held object back upright.
 """
@@ -72,6 +75,7 @@ from hrg.hand import (
     point_jacobians,
     to_world,
 )
+from hrg.profile import PoseProfile, TaskAccelerationLimit
 from hrg.qp import DistanceRows, solve_tracking_qp
 from hrg.robot import RobotModel
 from hrg.sdf import HalfSpaceSDF, PosedSDF
@@ -148,6 +152,19 @@ class HRGParams:
     posture_gain: float = 3.0  # 1/s
     select_w_pref: float = 2.0  # rad of joint motion per rad off the object's preferred approach
     select_shortlist: int = 6  # new candidates solved by IK per plan
+    # the arm's self-motion (docs/method.md, "Smoothness"): see ReachPlanner._null_task
+    null_weight: float = 1.0
+    null_gain: float = 2.0  # 1/s, toward the configuration at the grasp, along the self-motion (after the grasp)
+    null_lambda: float = 0.03  # the Jacobian's singular values below this count as self-motion
+    # what the fingertips' velocity may do on the way to the field's (hrg.profile)
+    task_accel: float = 6.5  # m/s^2
+    task_jerk: float = 150.0  # m/s^3
+    # ... the hand's turn toward the grasp, and the joints' toward its configuration
+    rot_accel: float = 15.0  # rad/s^2
+    rot_jerk: float = 300.0  # rad/s^3
+    posture_vmax: float = 0.9  # rad/s, norm: the posture field's speed
+    posture_accel: float = 5.0  # rad/s^2
+    posture_jerk: float = 80.0  # rad/s^3
 
     @classmethod
     def from_config(cls, cfg) -> "HRGParams":
@@ -203,6 +220,11 @@ class ReachPlanner:
         self._ik_cache: dict[tuple, dict] = {}
         self._choice = None  # the (pair, direction, swapped) chosen last plan
         self._q_grasp = None  # the chosen grasp's configuration (posture task)
+        self._q_rest = None  # the configuration kept along the self-motion after the grasp
+        self._task_limit = TaskAccelerationLimit(params.task_accel, params.task_jerk, self.plan_dt)
+        self._rot_limit = TaskAccelerationLimit(params.rot_accel, params.rot_jerk, self.plan_dt)
+        self._posture_limit = TaskAccelerationLimit(params.posture_accel, params.posture_jerk, self.plan_dt)
+        self._profile = None  # the pose reference after the grasp (hrg.profile)
 
     def reset(self) -> None:
         """New reach: forget the previous path solution and grasp configurations."""
@@ -210,6 +232,10 @@ class ReachPlanner:
         self._ik_cache.clear()
         self._choice = None
         self._q_grasp = None
+        self._q_rest = None
+        for limit in (self._task_limit, self._rot_limit, self._posture_limit):
+            limit.reset()
+        self._profile = None
         self._z_prev = None  # at rest, unless set_velocity says otherwise
         self._a_prev = None
 
@@ -288,6 +314,8 @@ class ReachPlanner:
             top = float(np.max(np.linalg.norm(xd_des, axis=1)))
             if top > p.v_const:
                 xd_des = xd_des * (p.v_const / top)
+        z_prev = np.zeros(N_Z) if self._z_prev is None else self._z_prev
+        xd_des = self._task_limit(xd_des, np.einsum("fij,j->fi", Jx, z_prev))
 
         # 4. auxiliary fields; both pads are fixed in the TCP frame
         omega_des, g = grasp_stability_field(x, np.stack([T_tcp[:3, :3]] * 2), PAD_CONTACT_AXES)
@@ -307,12 +335,17 @@ class ReachPlanner:
         rot_err = np.nan
         if R_star is not None:
             rot_err = float(np.linalg.norm(Rotation.from_matrix(R_star @ T_tcp[:3, :3].T).as_rotvec()))
-            tasks += self._alignment_tasks(T_tcp[:3, :3], R_star, J_ang)
-            if self._q_grasp is not None:
-                Jq = np.zeros((N_ARM, N_Z))
-                Jq[:, :N_ARM] = np.eye(N_ARM)
-                tasks.append((Jq, p.posture_gain * (self._q_grasp - q), p.posture_weight))
+            tasks += self._alignment_tasks(T_tcp[:3, :3], R_star, J_ang, z_prev)
+        qd_post = np.zeros((1, N_ARM))
+        if R_star is not None and self._q_grasp is not None:
+            qd_post[0] = _saturate(p.posture_gain * (self._q_grasp - q), p.posture_vmax)
+        qd_post = self._posture_limit(qd_post, z_prev[:N_ARM][None])[0]
+        if R_star is not None and self._q_grasp is not None:
+            Jq = np.zeros((N_ARM, N_Z))
+            Jq[:, :N_ARM] = np.eye(N_ARM)
+            tasks.append((Jq, qd_post, p.posture_weight))
         tasks.append((S, [wd_star], beta))
+        tasks.append(self._null_task(J_tcp, qd_post))
         lb, ub = self._bounds(q, w)
         rows = self._rows(q, T_tcp, J_tcp, w, obstacles, with_object=True,
                           obj_twist=None if obj_twist is None else (v_obj, om_obj, T_obj[:3, 3]))
@@ -327,7 +360,7 @@ class ReachPlanner:
             R_star=R_star,
         )
 
-    def _alignment_tasks(self, R_sb: np.ndarray, R_star: np.ndarray, J_ang: np.ndarray) -> list:
+    def _alignment_tasks(self, R_sb: np.ndarray, R_star: np.ndarray, J_ang: np.ndarray, z_prev: np.ndarray) -> list:
         """The hand's alignment with the grasp, in the body frame: for each
         vector pair, gripper ``n_b`` -> target ``n_t``,
 
@@ -342,14 +375,15 @@ class ReachPlanner:
         the speed is at its cap), decaying linearly to 0 as they align."""
         p = self.p
         J_b = R_sb.T @ J_ang
-        tasks = []
+        w_des, wgt = [], []
         for col in (1, 2):
             n_s, n_t = R_sb[:, col], R_star[:, col]
             c = np.cross(n_s, n_t)
             theta = float(np.arctan2(np.linalg.norm(c), n_s @ n_t))
-            w_des_b = R_sb.T @ _saturate(p.rot_gain * c, p.rot_max)
-            tasks.append((J_b, w_des_b, p.rot_weight * min(1.0, theta / np.radians(p.rot_threshold))))
-        return tasks
+            w_des.append(R_sb.T @ _saturate(p.rot_gain * c, p.rot_max))
+            wgt.append(p.rot_weight * min(1.0, theta / np.radians(p.rot_threshold)))
+        w_des = self._rot_limit(np.array(w_des), np.tile(J_b @ z_prev, (2, 1)))
+        return [(J_b, w_des[i], wgt[i]) for i in range(2)]
 
     def _select_oriented(self, q, T_tcp, J_tcp, T_obj, tg):
         """Step 2 of the oriented reach, in joint space: ``(j, k, swapped,
@@ -478,16 +512,35 @@ class ReachPlanner:
 
     # ------------------------------------------------------------ after the grasp
     def lift_step(self, q: np.ndarray, w: float, T_goal: np.ndarray, v_max: float, w_max: float,
-                  pos_gain: float, rot_gain: float, rot_weight: float, held=None, held_eps: float = 0.02):
-        """Joint velocities toward the TCP pose ``T_goal`` (6-D pose field,
-        saturated at ``v_max`` / ``w_max``), the width held, under ``Gamma``
-        and the hand vs table / obstacles (not the grasped object).
-        ``held``: points of a held object in the TCP frame (M, 3), kept
-        ``held_eps`` above the table."""
+                  pos_gain: float, rot_gain: float, rot_weight: float, held=None, held_eps: float = 0.02,
+                  a_max: float = 3.0, j_max: float = 40.0, wd_max: float = 8.0, wdd_max: float = 100.0,
+                  lag: float = 0.04, profile: bool = True):
+        """Joint velocities toward the TCP pose ``T_goal``, the width held, under
+        ``Gamma`` and the hand vs table / obstacles (not the grasped object).
+        With ``profile`` the hand follows a minimum-jerk reference to the goal
+        (``hrg.profile.PoseProfile``, within ``v_max``, ``a_max``, ``j_max`` and
+        their rotational ``w_max``, ``wd_max``, ``wdd_max``): the reference's
+        velocity plus a pose field on the error from where the reference was
+        ``lag`` s ago (the arm follows that late: the error from the reference
+        itself would read that as a fault, add speed, and overshoot the goal).
+        Without it, the pose field on the goal itself (following a moving
+        object: a reference would trail it). ``held``: points of a held object in the TCP frame (M, 3),
+        kept ``held_eps`` above the table."""
         T = self.robot.pose(q, self._data)
         J = self.robot.jacobian(q, self._data)
-        v = _saturate(pos_gain * (T_goal[:3, 3] - T[:3, 3]), v_max)
-        om = _saturate(rot_gain * Rotation.from_matrix(T_goal[:3, :3] @ T[:3, :3].T).as_rotvec(), w_max)
+        z_prev = np.zeros(N_Z) if self._z_prev is None else self._z_prev
+        if profile:
+            if self._profile is None:
+                tw = J[:, :N_ARM] @ z_prev[:N_ARM]
+                self._profile = PoseProfile(v_max, a_max, j_max, w_max, wd_max, wdd_max)
+                self._profile.start(T, tw[3:], tw[:3])
+            T_ref, v_ref, om_ref = self._profile.step(T_goal, self.plan_dt)
+        else:
+            self._profile = None
+            T_ref, v_ref, om_ref = T_goal, np.zeros(3), np.zeros(3)
+        e_rot = Rotation.from_matrix(T_ref[:3, :3] @ T[:3, :3].T).as_rotvec() - lag * om_ref
+        v = _saturate(v_ref + pos_gain * (T_ref[:3, 3] - lag * v_ref - T[:3, 3]), v_max)
+        om = _saturate(om_ref + rot_gain * e_rot, w_max)
         W = np.r_[np.full(3, rot_weight), np.ones(3)]
         J6 = np.zeros((6, N_Z))
         J6[:, :N_ARM] = W[:, None] * J
@@ -496,8 +549,11 @@ class ReachPlanner:
         rows = self._rows(q, T, J, w, (), with_object=False)
         if held is not None and len(held):
             self.held_rows(T, J, held, held_eps, rows)
-        z = solve_tracking_qp([(J6, W * np.r_[om, v], 1.0)], lb, ub, rows, reg=self.p.qp_reg,
-                              limits=self._arm_limits(q))
+        if self._q_rest is None:
+            self._q_rest = q.copy()
+        qd_rest = _saturate(self.p.null_gain * (self._q_rest - q), self.p.posture_vmax)
+        z = solve_tracking_qp([(J6, W * np.r_[om, v], 1.0), self._null_task(J, qd_rest)], lb, ub, rows,
+                              reg=self.p.qp_reg, limits=self._arm_limits(q))
         return self._finish(z, z is not None)[:N_ARM]
 
     def held_rows(self, T_tcp: np.ndarray, J_tcp: np.ndarray, P_tcp: np.ndarray, eps: float,
@@ -556,6 +612,26 @@ class ReachPlanner:
         return self._finish(z, z is not None)[:N_ARM]
 
     # ------------------------------------------------------------ QP pieces
+    def _null_task(self, J_tcp, qd_des):
+        """The arm's self-motion as a task: ``|N (qdot - qd_des)|^2`` with
+        ``N = V diag(l^2 / (s^2 + l^2)) V^T`` from the SVD of the TCP Jacobian: the
+        joint motions that hardly move the hand, softly, so ``N`` stays continuous
+        as the arm nears a singularity (the home pose has two such directions).
+
+        The tasks leave this direction free, the regulariser is all that prices
+        it, so whenever a torque or jerk row binds the QP pours motion into it.
+        It is also the arm's lightest direction: joints 1 and 3 turning against
+        each other weigh 0.06-0.3 kg m^2 where they weigh 2 kg m^2 alone, ten
+        times lighter than the Kd loop's gains assume, and with the FR3's torque
+        lag that loop barely damps it. Priced here, the plan has no energy for it."""
+        _, s, Vt = np.linalg.svd(J_tcp[:, :N_ARM], full_matrices=True)
+        s = np.r_[s, np.zeros(N_ARM - len(s))]
+        l2 = self.p.null_lambda ** 2
+        N = Vt.T @ np.diag(l2 / (s * s + l2)) @ Vt
+        A = np.zeros((N_ARM, N_Z))
+        A[:, :N_ARM] = N
+        return A, N @ np.asarray(qd_des, dtype=float), self.p.null_weight
+
     def _bounds(self, q, w):
         """The box on ``z``: velocity limits, the position limits reached
         within ``H``, and the acceleration limits over the plan period from

@@ -1,0 +1,14 @@
+# The object moved around by hand, as on the robot: fast, with changes of direction, and seen the
+# way the robot sees it (scripts/motion_quality.py --scenario hand). On top of configs/sim/env.yaml.
+carry:
+  box: [[0.40, 0.58], [-0.25, 0.25], [0.05, 0.20]]
+  waypoints: 8
+  speed: 0.6               # m/s along the path: above the fingertips' 0.5 m/s cruise
+  yaw_range: 1.0           # rad, each way
+  min_duration: 5.0        # s
+  seed: 1
+# FoundationPose + its filter (configs/robot/foundation_pose.yaml): ~24 Hz, ~60 ms late, ~1 mm / 0.5 deg
+# frame to frame.
+object_pose_update_dt: 0.042
+object_pose_delay: 0.06    # s
+object_pose_noise: [0.001, 0.5]   # m, deg (standard deviations)

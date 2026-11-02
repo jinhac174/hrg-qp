@@ -143,7 +143,7 @@ decide the width where an obstacle or the object is in the way.
 ### Eq. (11), the QP — `planner.ReachPlanner.step`, `hrg/qp.py`
 
 ```
-min_z  Σ_i |xdot_i,des − J_i z|² + α Σ_i |ω_i,des − J_ω z|² + β |wdot_des − S z|² + 1e-3 |z|²
+min_z  Σ_i |xdot_i,des − J_i z|² + α Σ_i |ω_i,des − J_ω z|² + β |wdot_des − S z|² + |N (qdot − qdot_post)|² + 1e-3 |z|²
 s.t.   Γ(q) + dΓ/dz z H >= ε_Γ                     robot vs walls / floor, robot vs itself
        d(X(q,w), O) + dd/dz z H >= ε_O + r         hand spheres vs object, table, obstacles
        q_min <= q + qdot H <= q_max,  0 <= w + wdot H <= 85 mm
@@ -193,10 +193,10 @@ s.t.   Γ(q) + dΓ/dz z H >= ε_Γ                     robot vs walls / floor, r
   nothing about. Bounded, the plan is a velocity profile the arm can
   follow, and the low level (Sec. II-D) realises exactly it. See "Speed".
 * **[FR3]** The torque rows: the torque the profile asks of the arm, the low
-  level's feed-forward `M â + g + C v`, within `s_τ = 0.8` of the FR3's
+  level's feed-forward `M â + g + C v`, within `s_τ = 0.7` of the FR3's
   torque (87 Nm on joints 1–4, 12 on 5–7) and its change from the previous
   plan within `s_τ` of the FR3's torque rate (1000 Nm/s, libfranka) over the
-  period: 8 Nm per plan (`joint_torque_limit_scale`; the rest is the Kd
+  period: 7 Nm per plan (`joint_torque_limit_scale`; the rest is the Kd
   feedback's and a held object's). The per-joint acceleration box alone does
   not bound either: `M(q)` couples the joints (joint 1 carries
   `M_13 ≈ 2 kg m²` of joint 3's acceleration), so 10 rad/s² on every joint at
@@ -210,7 +210,7 @@ s.t.   Γ(q) + dΓ/dz z H >= ε_Γ                     robot vs walls / floor, r
   builds over a few plans (the first plan moves the hand a few cm/s); the
   reaches and lifts take the same time.
 * **[FR3]** The jerk rows: each joint's acceleration changes from the previous
-  plan's by at most `j Δt_plan`, `j = 300 rad/s³` (`joint_jerk_limit`). The
+  plan's by at most `j Δt_plan`, `j = 200 rad/s³` (`joint_jerk_limit`). The
   FR3's link-side torque follows its command 1–7 ms late and with a 12–38 ms
   first-order lag (joint 1 the slowest), fitted to the flight recorder of a
   stop (`outputs/logs/reflex_20261102_174526.npz`, the torque sent against
@@ -438,6 +438,46 @@ R* = R_obj R_grasp,j,k (· Rz(π) for the other finger order)
 | Velocity, acceleration, torque limits | 0.8 × the FR3's position-dependent velocity limits within 2 / 2.5 rad/s; the FR3's 10 rad/s² (not in the paper), the width 2 m/s²; the plan's torque within 0.8 × the FR3's torque and torque rate (87 / 12 Nm, 1000 Nm/s); jerk 300 rad/s³ (the robot's torque lag) |
 | Start poses "left-bottom, center-up, right-bottom" | `hrg/study.py`: the ready pose, and the gripper pointing down 27 cm to either side with the fingertips at rim height |
 | GPU nearest-neighbour / via search | CPU (KD-tree, NumPy); plans take 3–15 ms |
+
+## Smoothness: why the arm shook, and what shapes the motion — `hrg/profile.py`, `planner._null_task`
+
+Speed (below) is about what bounds the motion. This is about its shape. Measured with
+`scripts/motion_quality.py`, which records through the settling and, unlike
+`diagnose_tracking.py`, keeps going after `hold` begins.
+
+* **The arm's self-motion.** The hand's six tasks leave one joint direction free (two at the home
+  pose, where joints 1 / 3 and 5 / 7 line up): joints 1 and 3 turning against each other, mostly.
+  Only `1e-3 |z|²` priced it, so whenever a torque or jerk row bound, the QP poured motion into it:
+  during a straight lift the plan itself swung joints 1 and 3 at ±0.5 rad/s, with the hand going
+  nowhere. That direction is also the arm's lightest (0.064 kg m² at the lift, where joint 1 alone
+  is 2.2). This is the "8 Hz joint 1 / 3 oscillation" of 2026-11-02. It is now a task,
+  `|N (qdot − qdot_post)|²` with `N = V diag(λ² / (s² + λ²)) Vᵀ` from the TCP Jacobian's SVD,
+  `λ = 0.03`: soft, so it stays continuous at a singularity, and narrow, because the weakest real
+  direction has `s ≈ 0.18` (at `λ = 0.15` that was priced at 40 % and the lift stalled 1 cm short).
+  After the grasp, `qdot_post` pulls toward the configuration at the grasp, along the self-motion.
+* **The lift is a trajectory** (`PoseProfile`). A saturated field steps to top speed and brakes on
+  a corner: 0.6 g, and the torque at 95 % of joint 2's limit. Now a minimum-jerk motion (the
+  quintic re-planned every step from the reference's own position, velocity and acceleration, so a
+  goal that moves stays continuous) with its error fed back through the pose field. The time left
+  grows only when the *goal* moves; from the distance left it would stretch every motion. The
+  error is read from where the reference was `lift_lag` ago: the arm trails a moving reference by
+  its lag, and read as a fault that lag adds speed and overshoots the goal (4 mm).
+* **The references of the reach are bounded** (`TaskAccelerationLimit`): the fingertip velocity
+  moves toward the field's within `task_accel` / `task_jerk`, measured from what the last plan
+  asked, so nothing winds up while the QP holds the hand back. The hand's turn and the posture
+  field too; the posture field stepped to `3 (q_grasp − q)`, 3 rad/s per joint, at the first plan:
+  the hand went to 0.82 m/s in a 0.5 m/s field. Below 6 m/s² the hand cuts the corners of the path
+  around the object and the reach takes twice as long.
+* **The Kd loop was nearly unstable.** With the FR3's torque lag, per-joint gains of 50 on joints 1
+  and 3 leave a damping ratio of 0.02-0.09 near 15 Hz at the poses used, and go unstable at 1 % of
+  random poses (poles of `M` + rotor inertia, the fitted delay and lag). `kd = [30, 50, 35, ...]`:
+  0.12-0.18, none unstable. It can be that low because the feed-forward carries the motion.
+* **Joint limits with room.** 8 rad/s², 200 rad/s³, 0.7 of the torque: limits the plans rarely
+  reach, not a profile they ride. The rest of the torque is the feedback's.
+* **The low level.** The velocity ramp lasts the plans' measured period (over a fixed 10 ms a late
+  plan dropped `M a` to zero until it came); the held object's weight fades in over 0.3 s (it is
+  still on the table at the grasp); the friction feed-forward's zero crossing is softer
+  (`v_smooth` 0.05 rad/s).
 
 ## Speed: how the velocity is made, what sets it, what bounds it
 

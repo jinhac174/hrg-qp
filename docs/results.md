@@ -29,6 +29,41 @@ the object is held (`is_grasped`) 5 cm above its rest height within the time
 limit; trials where the bus or a process died are marked `infra` and
 repeated, never counted.
 
+## Smoothness (2026-11-02, after "Very jerky")
+
+`scripts/motion_quality.py`, real-time simulation with the fitted torque response, one run at a time.
+Static: gold bowl from the three start poses and the mug from center-up. Moved: the object carried at up
+to 0.6 m/s with FoundationPose-like noise and latency, `configs/sim/env_hand.yaml`, seeds 1-4. Before =
+the commit before this work, same harness.
+
+| Static | before | after |
+|---|---|---|
+| Lift: peak height acceleration | 5.2-6.2 m/s² | 2.2-2.6 m/s² |
+| Lift: peak hand jerk | 162-245 m/s³ | 55-74 m/s³ |
+| Lift: joint shake above 5 Hz (worst joint RMS) | 0.030-0.043 rad/s | 0.007-0.023 rad/s |
+| Lift: joint 1 / 3 counter-motion | 0.41-0.45 rad/s | 0.04-0.14 rad/s |
+| Lift: peak torque / limit | 0.78-0.91 | 0.56-0.70 |
+| Lift: overshoot | 0 mm | 0 mm |
+| Reach: peak hand acceleration | 8.2-11.0 m/s² | 4.3-6.2 m/s² |
+| Reach: joint shake above 5 Hz | 0.047-0.129 rad/s | 0.031-0.045 rad/s |
+| Reach: ticks above the torque rate | 1.8-4.2 % | 0.0-0.2 % |
+| Time to the grasp | 1.1-1.6 s | 1.4-1.7 s |
+
+| Moved | before | after |
+|---|---|---|
+| Runs that reached hold | 3 of 4 | 4 of 4 |
+| Lift: peak torque / limit | 0.90-19.4 (one blow-up, 14 rad/s counter-motion) | 0.63-0.74 |
+| Lift: overshoot | up to 32 mm | up to 3.7 mm |
+| Feed-forward torque / limit in the reach | 0.79-0.91 | 0.70-0.73 |
+| Ticks above the torque rate in the reach | 6.5-16.3 % | 0.6-1.8 % |
+
+The reach's measured torque in the moved runs (0.8-9.6 of the limit) is the carried object striking a
+finger (a kinematic carrier does not yield): the joint's velocity jumps with no command behind it.
+Under load (five simulations at once, plans at 23 ms median, ten runs): before, 2 runs never held and
+the grasp took up to 18 s; after, all ten held, grasps in 3.0-5.2 s, lift torque up to 1.6 of the limit
+on the wrist. 72 / 72 kinematic reaches converge before and after, median time unchanged to +0.1 s (one
+case +0.4 s).
+
 ## Within the FR3's own limits; one goal after the grasp (2026-11-02, after the first robot runs)
 
 On the robot the arm bounced after the lift and stopped itself twice while chasing a bowl moved by

@@ -12,8 +12,9 @@ At the *measured* joints ``q`` and width ``w`` (the feedback of the method):
   ``grasp_trigger_rot`` of its target orientation.
 * ``close``: wait for the gripper. Fingers stopped on something: ``lift``.
   Nothing between them: open again and reach again (``reopen``).
-* ``lift``: the TCP goes ``lift_height`` straight up (pose field through the
-  same QP), then ``upright`` (``grasp.upright``) or ``hold``.
+* ``lift``: the TCP goes ``lift_height`` straight up (a minimum-jerk reference,
+  ``hrg.profile``, its error fed back through a pose field, through the same
+  QP), then ``upright`` (``grasp.upright``) or ``hold``.
 * ``upright``: the hand turns the held object back to its upright pose
   (``ReachPlanner.upright_goal``: the smallest tilt, raised to clear the
   table) until it is within ``upright_tol``, then ``hold``. During ``lift`` and ``upright`` the held object's points stay
@@ -155,7 +156,11 @@ class HRGController(BaseController):
         self._lift_tol = float(g["lift_tol"])
         self._lift_cfg = dict(v_max=float(g["lift_speed"]), w_max=float(g["lift_angular_speed"]),
                               pos_gain=float(g["lift_pos_gain"]), rot_gain=float(g["lift_rot_gain"]),
-                              rot_weight=float(g["lift_rot_weight"]))
+                              rot_weight=float(g["lift_rot_weight"]),
+                              a_max=float(g.get("lift_accel", 3.0)), j_max=float(g.get("lift_jerk", 40.0)),
+                              wd_max=float(g.get("lift_angular_accel", 8.0)),
+                              wdd_max=float(g.get("lift_angular_jerk", 100.0)),
+                              lag=float(g.get("lift_lag", 0.04)))
         self._trigger_rot = np.radians(float(g.get("grasp_trigger_rot", 10.0)))
         self._upright = bool(g.get("upright", True))
         self._upright_clearance = float(g.get("upright_clearance", 0.03))
@@ -166,6 +171,10 @@ class HRGController(BaseController):
         self._payload_comp = bool(g.get("payload_comp", True))
         self._obj_com = self._object_com()
         self._held = None  # (mass, centre of mass in the TCP frame) while holding: added to g(q)
+        self._held_last = None  # ... kept while the term fades out
+        self._held_ramp = max(float(g.get("payload_ramp", 0.3)), 1e-3)  # s, the term's fade in / out
+        self._held_scale = 0.0
+        self._t_held = None
         self._home_gain = float(config["home_gain"])
         self._hold_gain = float(config.get("hold_gain", 5.0))
         self._hold_vmax = float(config.get("hold_vmax", 0.3))
@@ -386,10 +395,18 @@ class HRGController(BaseController):
     def _payload_torque(self, q) -> np.ndarray:
         """``J_p(c)^T m g`` for the held object at ``c`` (TCP frame): what
         holds it up (``None`` held: zeros)."""
+        # Faded in and out: the object is still on the table when it is grasped, and a step of its
+        # weight (2 Nm on joint 2 for a mug held out) kicks the arm up before the lift starts.
         held = self._held
-        if held is None:
+        step = (self._ctrl_dt if self._t_held is None else max(self._cur_time - self._t_held, 0.0)) / self._held_ramp
+        self._t_held = self._cur_time
+        self._held_scale = float(np.clip(self._held_scale + (step if held is not None else -step), 0.0, 1.0))
+        if held is not None:
+            self._held_last = held
+        if self._held_scale <= 0.0 or self._held_last is None:
             return np.zeros(N_ARM)
-        m, c = held
+        m, c = self._held_last
+        m = m * self._held_scale
         T = self._robot.pose(q, self._pin_ctrl)
         J = self._robot.jacobian(q, self._pin_ctrl)
         Jp = J[3:] - skew(T[:3, :3] @ c) @ J[:3]
@@ -503,7 +520,7 @@ class HRGController(BaseController):
                 # closed, and the object rows pushed it off the closing fingers: boxes tipped.)
                 if T_obj is None or done or self._T_obj_tcp is None:
                     return self._hold_plan(q, w)
-                return Plan(self._planner.lift_step(q, w, T_obj @ self._T_obj_tcp, **self._lift_cfg))
+                return Plan(self._planner.lift_step(q, w, T_obj @ self._T_obj_tcp, **self._lift_cfg, profile=False))
             if state in ("lift", "upright", "hold"):
                 if gs is not None and not gs.is_grasped:
                     print("[HRG] Object lost: opening, reaching again.")

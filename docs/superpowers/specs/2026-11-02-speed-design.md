@@ -118,7 +118,7 @@ was right:
   growing to ±2.4 rad/s until the power limit stopped the robot. The simulation had no torque-rate
   limit, so it never showed any of this.
 * Fix (one constraint, where the plan is made): the QP bounds the torque each plan asks of the arm,
-  `|M â + g + C v| <= 0.8 τ_max` and `|M (â − â_prev)| <= 0.8 τ̇_max Δt` (8 Nm per plan), as hard
+  `|M â + g + C v| <= 0.8 τ_max` and `|M (â − â_prev)| <= 0.8 τ̇_max Δt` (8 Nm per plan; 0.7 and 7 Nm since round six), as hard
   rows that give way only to the box; the low level ramps the inertial feed-forward at 0.8 τ̇_max
   instead of stepping it, leaving the rest of the robot's torque rate to the Kd term. The
   simulation now has the FR3's torque-rate limit.
@@ -153,6 +153,29 @@ flight recorder had the torque actually sent, and showed:
   plans were realisable. Not kept.
 * The lift's top speed is now 0.5 m/s (the reach's): the arm brakes one torque lag after its plan,
   1.6 cm past the goal from 0.8 m/s in the simulation, none from 0.5.
+
+## Round six: the motion's shape (same day)
+
+The user ran it fast and moved the object ("acceleration ... too jerky ... torque limit ... robot goes
+red"; "after grasp the arm comes up abruptly and overshoots stiffly and shows shaky motion"). No robot
+log in this checkout, so measured in the simulation with `scripts/motion_quality.py` (new: it records
+through the settling; `diagnose_tracking.py` stops as `hold` begins). `docs/method.md`, "Smoothness",
+has the account. What rounds four and five had not seen:
+
+* The plan itself drove joints 1 and 3 against each other, ±0.5 rad/s on a straight lift: the arm's
+  self-motion, priced by nothing but the regulariser. The bounds of rounds four and five limited how
+  fast that happened, not that it happened. Priced (`_null_task`), the lift's joint 1 / 3 shake fell
+  from 0.068 to 0.002 rad/s, on a change of one QP term.
+* The Kd loop was nearly unstable at the fitted torque lag (damping ratio 0.02-0.09). A first pole
+  calculation on the bare URDF said 76 % of poses unstable: wrong, it had no rotor inertia.
+* The lift was a saturated field, not a trajectory; the reach's posture field stepped to 3 rad/s.
+* Wrong turns, kept here so they are not repeated: `task_accel` 5 m/s² doubled the reach from the low
+  poses; `null_lambda` 0.15 priced real hand motion and stalled the lift; recomputing the duration from
+  the distance left stretched the lift; a metric that smoothed a cut signal reported 45 rad/s²
+  of commanded acceleration that never existed.
+
+Not changed: the wrist's Kd, and the sim's torque lags, which remain fitted to one flight recorder.
+Validated in simulation only.
 
 ## The governing relation
 

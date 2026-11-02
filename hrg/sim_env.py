@@ -61,6 +61,11 @@ class HRGSimEnv(MujocoColEnv):
         self._obstacles_channel = pm.get("obstacles_channel", "")
         self._object_pose_dt = float(config.get("object_pose_update_dt", 1.0 / 30.0))
         self._last_object_pose_t = -1e9
+        # the perception's imperfection (default none): the pose this late and this noisy
+        self._pose_delay = float(config.get("object_pose_delay", 0.0))
+        self._pose_noise = np.asarray(config.get("object_pose_noise", [0.0, 0.0]), dtype=float)
+        self._pose_rng = np.random.default_rng(int(config.get("obj_spawn_seed", 0)) + 300)
+        self._pose_buf: list = []
         self._spawn_xy_center = np.asarray(config.get("obj_spawn_xy_center", [0.5, 0.0]), dtype=float)
         self._spawn_xy_half = np.asarray(config.get("obj_spawn_xy_half", [0.05, 0.08]), dtype=float)
         self._spawn_yaw_half = float(config.get("obj_spawn_yaw_half", np.pi))
@@ -285,14 +290,26 @@ class HRGSimEnv(MujocoColEnv):
     def _sync_data_from_sim(self, intr_pub_que_dict, extr_pub_que_dict, time_pub_que):
         super()._sync_data_from_sim(intr_pub_que_dict, extr_pub_que_dict, time_pub_que)
         t = float(self.mj_data.time)
+        if self._pose_delay > 0.0:
+            self._pose_buf.append((t, self.mj_data.xmat[self._object_body_id].reshape(3, 3).copy(),
+                                   self.mj_data.xpos[self._object_body_id].copy()))
+            while len(self._pose_buf) > 1 and self._pose_buf[1][0] <= t - self._pose_delay:
+                self._pose_buf.pop(0)
         if t - self._last_object_pose_t < self._object_pose_dt:
             return
         self._last_object_pose_t = t
         if self._object_pose_channel:
             b = self._object_body_id
             T = np.eye(4)
-            T[:3, :3] = self.mj_data.xmat[b].reshape(3, 3)
-            T[:3, 3] = self.mj_data.xpos[b]
+            if self._pose_delay > 0.0:
+                _, T[:3, :3], T[:3, 3] = self._pose_buf[0]
+            else:
+                T[:3, :3] = self.mj_data.xmat[b].reshape(3, 3)
+                T[:3, 3] = self.mj_data.xpos[b]
+            if np.any(self._pose_noise > 0.0):
+                T[:3, 3] += self._pose_rng.normal(0.0, self._pose_noise[0], 3)
+                rv = self._pose_rng.normal(0.0, np.radians(self._pose_noise[1]), 3)
+                T[:3, :3] = Rotation.from_rotvec(rv).as_matrix() @ T[:3, :3]
             msg = SE3PoseData(name=self._object_pose_channel)
             msg.set_from_matrix(t, T)
             self._put_latest(extr_pub_que_dict[self._object_pose_channel], msg)

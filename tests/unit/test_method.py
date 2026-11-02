@@ -402,14 +402,14 @@ def test_reach_step_is_a_function_of_the_state(planner):
     assert r.paths.shape == (2, 100, 3)
     assert np.all(np.isfinite(r.qd)) and np.isfinite(r.wd)
     # far from the target the fingertips accelerate along the paths (the first plan from rest is
-    # bounded by the FR3's torque rate: a few cm/s at the hand), toward v_const
+    # bounded by task_jerk: 1.5 cm/s at the hand), toward v_const
     T = p.robot.pose(q, p.robot.data())
     J = p.robot.jacobian(q, p.robot.data())
     x, Jx = fingertip_state(T, J, 0.085)
     v = np.einsum("fij,j->fi", Jx, np.r_[r.qd, r.wd])
     d = (r.paths[:, 1] - r.paths[:, 0])
     d /= np.linalg.norm(d, axis=1, keepdims=True)
-    assert np.all(np.einsum("fi,fi->f", v, d) > 0.02)
+    assert np.all(np.einsum("fi,fi->f", v, d) > 0.01)
     # every plan reports what binds (nothing, at the ready pose far from the object)
     assert r.info["binding"] == dict(rows=[], joint_limits=[])
     # the same state gives the same plan (from a reset)

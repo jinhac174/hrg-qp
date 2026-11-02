@@ -193,7 +193,9 @@ def test_velocity_ramp_reaches_each_plan_within_the_period_with_its_acceleration
     v, a = ramp.at(0.02)  # late next plan: held, no acceleration
     np.testing.assert_allclose(v, [0.1, -0.2])
     np.testing.assert_allclose(a, 0.0)
+    ramp.period = 0.01  # (the late plan is the next test's)
     ramp.new_plan([0.2, -0.2], t=0.02)
+    ramp.period = 0.01
     v, a = ramp.at(0.025)
     np.testing.assert_allclose(v, [0.15, -0.2])
     np.testing.assert_allclose(a, [10.0, 0.0])

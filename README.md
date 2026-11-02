@@ -14,7 +14,8 @@ FR3's acceleration limits. At 1 kHz: the paper's low level, PD on the QP
 velocity integrated over one control interval (a damping controller: Kp is
 0), with the plan's acceleration, gravity (wrist camera and held object
 included) and friction fed forward. Fast by default (0.5 m/s fingertips, the
-FR3's acceleration limits, a 0.4 s lift; docs/method.md "Speed"), the
+within the FR3's acceleration limits, a 0.6 s minimum-jerk lift; docs/method.md "Speed"
+and "Smoothness"), the
 gripper moves continuously at the commanded rate, and a moving object is
 followed with its pose extrapolated between perception frames.
 
