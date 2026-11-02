@@ -32,34 +32,43 @@ At the *measured* joints ``q`` and width ``w`` (the feedback of the method):
 * ``home`` (key ``h``): joint-space field to ``default_q_values`` through the
   same QP.
 
-Control thread (``ctrl_freq``, 1 kHz)
-------------------------------------
+Control thread (``ctrl_freq``, 1 kHz) -- ``hrg.lowlevel``
+----------------------------------------------------------
 Paper Sec. II-D: ``qdot_des`` is "integrated over one control interval to
 obtain the desired joint position" and tracked by "PD control with gravity
 compensation": every control tick (``ref_mode: step``, the paper)
 
-    q_des  = q + qdot_des dt
-    tau    = Kp (q_des - q) + Kd (qdot_des - qdot) + g(q) + C(q, qdot) qdot + tau_f(qdot_des)
+    qd_cmd = the plan's velocity, ramped from the previous plan over the plan period
+    q_des  = q + qd_cmd dt
+    tau    = Kp (q_des - q) + Kd (qd_cmd - qdot) + M(q) qdd_cmd + g(q) + C(q, qdot) qdot + tau_f(qd_cmd)
 
 (sent as ``joint_ctrl_t``; the sim / ``run_hardware.py`` evaluates the PD at
-1 kHz with the latest measurement). ``Kp (q_des - q) = Kp dt qdot_des`` then
-only adds ~1 % to the Kd term, so ``kp`` is 0: a damping (velocity)
-controller, and position is fed back by the planner (the QP is solved at the
-measured state every 10 ms; the holding states run a joint field).
-``ref_mode: integral`` is the earlier variant, ``q_des <- q_des + qdot_des
-dt`` within ``max_ref_err`` of ``q`` (with ``kp`` > 0 an integral of the
-velocity error). ``tau_f`` is the friction feed-forward on the *commanded*
-velocity, ``scale (coulomb tanh(qdot_des / v_smooth) + viscous qdot_des)``,
-capped at ``max`` (``friction:``; on the robot from
-``scripts/robot/identify_friction.py``). ``qdot_des`` passes a first-order
-filter (``qd_filter``: the plan changes in steps at 100 Hz, the FR3 rejects
-torque steps). If no plan arrived for ``max_plan_age`` s the joints are held
-where they were (``stale_hold_kp`` / ``kd``) until plans come again.
+1 kHz with the latest measurement). ``Kp (q_des - q) = Kp dt qd_cmd`` only
+adds ~1 % to the Kd term, so ``kp`` is 0: a damping (velocity) controller,
+and position is fed back by the planner (the QP is solved at the measured
+state every 10 ms; the holding states run a joint field). **[FR3]** ``M(q)
+qdd_cmd`` (``inertia_ff``) feeds the command's acceleration forward: the Kd
+loop alone follows a velocity command with the time constant ``M_ii / Kd_i``
+(30-60 ms on joints 1-4), which the QP horizon had to cover and which at speed
+overshoots the collision margins; with it the arm follows the planned
+velocity profile and ``Kd`` only corrects errors. The plans change by at most
+the acceleration limits per period (the QP), so the ramp's acceleration is
+what the robot can do and the torque has no steps.
+``ref_mode: integral`` is the earlier variant, ``q_des <- q_des + qd_cmd dt``
+within ``max_ref_err`` of ``q`` (with ``kp`` > 0 an integral of the velocity
+error). ``tau_f`` is the friction feed-forward on the *commanded* velocity,
+``scale (coulomb tanh(qd_cmd / v_smooth) + viscous qd_cmd)``, capped at
+``max`` (``friction:``; on the robot from
+``scripts/robot/identify_friction.py``). If no plan arrived for
+``max_plan_age`` s the joints are held where they were (``stale_hold_kp`` /
+``kd``) until plans come again.
 
 The gripper is position-servoed (the Robotiq, and its sim): ``wdot_des`` is
-realised the same way, as a set-point ``w_ref += wdot_des dt`` kept within
-``width_max_lead`` of the measured width and streamed as ``move`` commands at
-``width_stream_freq``.
+realised as a stream of set-points a little ahead of the integrated width
+``w_ref`` (kept within ``width_max_lead`` of the measured width), each at the
+**speed** ``|wdot_des|``, at ``width_stream_freq`` (``lowlevel.WidthStream``):
+the fingers move continuously at the commanded rate. The grasp itself is one
+``grasp`` command at ``grasp_speed``.
 
 Keyboard (controller terminal)
 ------------------------------
@@ -87,7 +96,8 @@ from fr3.data_type.basic_types.SE3PoseData import SE3PoseData
 from hrg import obstacles as obstacle_msg
 from fr3.utils.lie.so3 import skew
 from hrg.friction import friction_torque
-from hrg.hand import MAX_WIDTH, MAX_WIDTH_RATE, N_ARM
+from hrg.hand import MAX_WIDTH, MAX_WIDTH_ACCEL, N_ARM, N_Z
+from hrg.lowlevel import PosePredictor, VelocityRamp, WidthStream
 from hrg.objects import GraspObject
 from hrg.paths import resolve
 from hrg.planner import HRGParams, ReachPlanner, ReachStep, binding_text
@@ -114,16 +124,18 @@ class HRGController(BaseController):
             config["urdf_path"], config["joint_velocity_limit"],
             env_pairs=config["col_pairs"], self_pairs=config["self_col_pairs"],
             env_margin=float(config["env_col_margin"]), self_margin=float(config["self_col_margin"]),
+            joint_acceleration_limit=config.get("joint_acceleration_limit", None),
         )
         self._obj = GraspObject(config["object_config"])
         self._params = HRGParams.from_config(config["hrg"])
+        self._plan_dt = 1.0 / float(config["plan_freq"])
         self._planner = ReachPlanner(
             self._params, self._robot,
             FingertipTargets.load(resolve(self._obj.cfg["fingertip_targets"]), self._obj.cfg.get("approach_axis")),
-            sdf_from_config(self._obj.cfg["sdf"]), table_z=float(g["table_z"]),
+            sdf_from_config(self._obj.cfg["sdf"]), table_z=float(g["table_z"]), plan_dt=self._plan_dt,
+            width_accel=float(config.get("width_acceleration_limit", MAX_WIDTH_ACCEL)),
         )
         self._q_home = np.asarray(config["default_q_values"], dtype=float)
-        self._plan_dt = 1.0 / float(config["plan_freq"])
 
         # Grasp / lift / home
         self._trigger = float(g["grasp_trigger_dist"])
@@ -164,11 +176,13 @@ class HRGController(BaseController):
         self._fr_viscous = np.asarray(fr.get("viscous", [0.0] * N_ARM), dtype=float)
         self._fr_vs = float(fr.get("v_smooth", 0.02))
         self._fr_max = np.asarray(fr.get("max", [1.0] * N_ARM), dtype=float)
-        self._qd_filter = float(config["qd_filter"])
+        self._inertia_ff = bool(config.get("inertia_ff", True))
         self._max_ref_err = float(config["max_ref_err"])
         self._max_plan_age = float(config["max_plan_age"])
-        self._w_stream_dt = 1.0 / float(config["width_stream_freq"])
-        self._w_lead = float(config["width_max_lead"])
+        self._ramp = VelocityRamp(N_Z, self._plan_dt)
+        self._wstream = WidthStream(1.0 / float(config["width_stream_freq"]), float(config["width_max_lead"]))
+        self._pose_pred = PosePredictor() if bool(config.get("object_pose_predict", True)) else None
+        self._obj_twist = None  # the object's (v, omega) at the last snapshot
 
         # Channels
         self._arm_meas_channel = sm["arm_joint_meas_channel"]
@@ -197,6 +211,7 @@ class HRGController(BaseController):
         self._T_lift = None
         self._lift_t0 = 0.0
         self._T_tcp_obj = None  # the object in the hand, recorded when the gripper closes
+        self._T_obj_tcp = None  # its inverse at the trigger: the hand's pose on the object, kept while closing
         self._grasp_point = np.zeros(3)  # the grasped contact pair's midpoint, object frame
         self._no_target = False  # reported that no target is reachable (once)
         self._q_hold = None  # joints the holding states keep
@@ -213,15 +228,9 @@ class HRGController(BaseController):
 
         # Control thread
         self._plan_que = None  # set in initialize (queue.Queue(maxsize=1))
-        self._qd_des = np.zeros(N_ARM)
-        self._wd_des = 0.0
-        self._qd_filt = np.zeros(N_ARM)
         self._q_ref = None
         self._q_stale = None
         self._plan_stamp = -np.inf
-        self._w_ref = None
-        self._w_last_sent = None
-        self._w_last_sent_t = -np.inf
         self._pin_ctrl = self._robot.data()
 
         self._stop = threading.Event()
@@ -287,14 +296,20 @@ class HRGController(BaseController):
                 T[:3, :3] = Rotation.from_quat(np.roll(wxyz, -1)).as_matrix()
                 T[:3, 3] = pos
                 self._T_obj = T
+                if self._pose_pred is not None:
+                    self._pose_pred.update(T, self._cur_time)
             if isinstance(obs, NamedVecListData):
                 self._obstacles = obstacle_msg.decode(obs.get_data()[2]) if obs.num_vecs else []
 
     def _snapshot(self):
         with self._lock:
             gs = self._gripper_state
+            if self._planner._z_prev is None:  # the first plan accelerates from the arm's actual velocity
+                self._planner.set_velocity(self._qd)
+            T_obj = self._T_obj if self._pose_pred is None else self._pose_pred.at(self._cur_time)
+            self._obj_twist = None if self._pose_pred is None else (self._pose_pred.v.copy(), self._pose_pred.omega.copy())
             return (self._q.copy(), None if gs is None else float(gs.width),
-                    None if self._T_obj is None else self._T_obj.copy(), list(self._obstacles), gs)
+                    None if T_obj is None else T_obj.copy(), list(self._obstacles), gs)
 
     # ------------------------------------------------------------ keyboard
     def _handle_key(self, key: str) -> None:
@@ -369,13 +384,14 @@ class HRGController(BaseController):
         Jp = J[3:] - skew(T[:3, :3] @ c) @ J[:3]
         return Jp.T @ np.array([0.0, 0.0, m * 9.81])
 
-    def _hold_plan(self, q) -> Plan:
-        """Keep the joints where the holding state began (through the
-        planner: with ``kp = 0`` nothing else holds the arm)."""
+    def _hold_plan(self, q, w) -> Plan:
+        """Keep the joints where the holding state began: the joint field
+        ``hold_gain (q_hold - q)`` through the planner's QP (with ``kp = 0``
+        nothing else holds the arm; the QP keeps it within the collision
+        margins and the acceleration limits like every other motion)."""
         if self._q_hold is None:
             self._q_hold = q.copy()
-        qd = np.clip(self._hold_gain * (self._q_hold - q), -self._hold_vmax, self._hold_vmax)
-        return Plan(qd)
+        return Plan(self._planner.home_step(q, w, self._q_hold, self._hold_gain, vmax=self._hold_vmax))
 
     def _held_tcp(self):
         """The held object's points in the TCP frame (None before a grasp)."""
@@ -450,10 +466,10 @@ class HRGController(BaseController):
         with self._fsm_lock:
             state = self._state
         if state == "reach":  # planned outside the lock (the keyboard takes it)
-            return self._hold_plan(q) if T_obj is None else self._reach(q, w, T_obj, obstacles)
+            return self._hold_plan(q, w) if T_obj is None else self._reach(q, w, T_obj, obstacles)
         with self._fsm_lock:
             if state != self._state:  # changed by a key meanwhile
-                return self._hold_plan(q)
+                return self._hold_plan(q, w)
             if state == "close":
                 done = self._gripper_done(gs)
                 if done:
@@ -468,19 +484,27 @@ class HRGController(BaseController):
                 elif done is False:
                     print("[HRG] Grasp failed (nothing between the fingers): opening, reaching again.")
                     self._reopen()
-                return self._hold_plan(q)
+                    return self._hold_plan(q, w)
+                # While the fingers close the hand keeps its pose relative to the object (the
+                # pose field of the lift, no object rows: the pads are meant to touch it now): a
+                # moving object is followed, not run into or left behind; a resting one holds the
+                # hand still. (Tracking the fingertip *targets* here moved the hand as the pads
+                # closed, and the object rows pushed it off the closing fingers: boxes tipped.)
+                if T_obj is None or done or self._T_obj_tcp is None:
+                    return self._hold_plan(q, w)
+                return Plan(self._planner.lift_step(q, w, T_obj @ self._T_obj_tcp, **self._lift_cfg))
             if state in ("lift", "upright", "hold"):
                 if gs is not None and not gs.is_grasped:
                     print("[HRG] Object lost: opening, reaching again.")
                     self._reopen()
-                    return self._hold_plan(q)
+                    return self._hold_plan(q, w)
                 if state == "hold":
-                    return self._hold_plan(q)
+                    return self._hold_plan(q, w)
                 T_tcp = self._planner.tcp_pose(q)
                 if state == "lift":
                     if (np.linalg.norm(T_tcp[:3, 3] - self._T_lift[:3, 3]) <= self._lift_tol
                             or time.time() - self._lift_t0 > self._lift_timeout):
-                        return self._after_lift(q, T_tcp, T_obj)
+                        return self._after_lift(q, w, T_tcp, T_obj)
                     return Plan(self._planner.lift_step(q, w, self._T_lift, **self._lift_cfg,
                                                         held=self._held_tcp(), held_eps=self._held_eps))
                 # upright: a feedback loop on the object's tilt in the hand (refreshed by the
@@ -493,7 +517,7 @@ class HRGController(BaseController):
                     print(f"[HRG] Upright ({np.degrees(tilt):.1f} deg, {time.time() - self._t_start:.1f} s). "
                           "Press x to release.")
                     self._enter("hold")
-                    return self._hold_plan(q)
+                    return self._hold_plan(q, w)
                 return Plan(self._planner.lift_step(q, w, T_up, **self._lift_cfg,
                                                     held=self._held_tcp(), held_eps=self._held_eps))
             if state == "reopen":
@@ -501,10 +525,10 @@ class HRGController(BaseController):
                     self._planner.reset()
                     self._enter("reach")
                     self._streaming = True
-                return self._hold_plan(q)
+                return self._hold_plan(q, w)
             if state == "home":
                 return Plan(self._planner.home_step(q, w, self._q_home, self._home_gain))
-        return self._hold_plan(q)
+        return self._hold_plan(q, w)
 
     def _refresh_in_hand(self, T_tcp, T_obj) -> bool:
         """Take the object's pose in the hand from the tracker if it is
@@ -524,7 +548,7 @@ class HRGController(BaseController):
         self._set_held()
         return True
 
-    def _after_lift(self, q, T_tcp, T_obj) -> Plan:
+    def _after_lift(self, q, w, T_tcp, T_obj) -> Plan:
         """Lifted: turn the object upright (``upright``) or hold."""
         self._refresh_in_hand(T_tcp, T_obj)
         tilt = 0.0
@@ -533,21 +557,21 @@ class HRGController(BaseController):
         if tilt <= self._upright_tol:
             print(f"[HRG] Lifted ({time.time() - self._t_start:.1f} s). Press x to release.")
             self._enter("hold")
-            return self._hold_plan(q)
+            return self._hold_plan(q, w)
         print(f"[HRG] Lifted ({time.time() - self._t_start:.1f} s); turning the object upright "
               f"({np.degrees(tilt):.0f} deg).")
         self._T_lift, self._lift_t0 = T_up, time.time()  # its position stays the goal's
         self._enter("upright")
-        return self._hold_plan(q)
+        return self._hold_plan(q, w)
 
     def _reach(self, q, w, T_obj, obstacles) -> Plan:
         t0 = time.perf_counter()
-        r = self._planner.step(q, w, T_obj, obstacles)
+        r = self._planner.step(q, w, T_obj, obstacles, obj_twist=self._obj_twist)
         if r is None:
             if not self._no_target:
                 print("[HRG] No reachable fingertip target for this object pose (holding).")
             self._no_target = True
-            return self._hold_plan(q)
+            return self._hold_plan(q, w)
         self._no_target = False
         if not r.qp_ok:
             print("[HRG] QP failed: holding this plan.")
@@ -556,11 +580,12 @@ class HRGController(BaseController):
         if np.all(err <= self._trigger) and aligned:
             with self._fsm_lock, self._gripper_lock:
                 if self._state != "reach":  # a key meanwhile
-                    return self._hold_plan(q)
+                    return self._hold_plan(q, w)
                 self._streaming = False
                 # The object in the hand, for the lift (live tracking is
                 # unreliable once the gripper hides it).
                 self._T_tcp_obj = np.linalg.inv(self._planner.tcp_pose(q)) @ T_obj
+                self._T_obj_tcp = np.linalg.inv(self._T_tcp_obj)  # the hand's pose on the object during the close
                 tg = self._planner.targets
                 self._grasp_point = 0.5 * (tg.p1[r.target] + tg.p2[r.target])  # object frame
                 self._wait_for(self._grasp(r.contact_width, float(np.linalg.norm(r.x_tgt[1] - r.x_tgt[0]))))
@@ -571,7 +596,7 @@ class HRGController(BaseController):
                   f"grasping at {r.contact_width * 1e3:.1f} mm, {self._grasp_force:.0f} N")
             print(f"[HRG] plan time {np.median(ts):.1f} ms median, {np.max(ts):.1f} ms max over the reach")
             self._plan_times.clear()
-            plan = self._hold_plan(q)  # (the state is close now: holds from here)
+            plan = self._hold_plan(q, w)  # (the state is close now: holds from here)
             plan.reach = r
             return plan
         self._plan_times.append(time.perf_counter() - t0)
@@ -592,21 +617,27 @@ class HRGController(BaseController):
             plan = self._plan_que.get_nowait()
         except Empty:
             plan = None
+        t = self._cur_time
         if plan is not None:
-            self._qd_des, self._wd_des = plan.qd, plan.wd
-            self._plan_stamp = self._cur_time
+            self._ramp.new_plan(np.r_[plan.qd, plan.wd], t)
+            self._plan_stamp = t
             if plan.reach is not None:
                 self._publish_reach(plan.reach)
         with self._lock:
             q, qd = self._q.copy(), self._qd.copy()
             gs = self._gripper_state
-        fresh = self._cur_time - self._plan_stamp <= self._max_plan_age
+        fresh = t - self._plan_stamp <= self._max_plan_age
+        if not fresh:
+            self._ramp.stop(t)
 
-        # Arm: q_des from qdot_des (ref_mode); PD + gravity / Coriolis + friction.
-        a = float(np.clip(self._qd_filter, 0.0, 1.0))
-        self._qd_filt = a * (self._qd_des if fresh else 0.0) + (1.0 - a) * self._qd_filt
-        tau_ff = (self._robot.gravity_coriolis(q, qd, self._pin_ctrl) + self.friction(self._qd_filt)
+        # Arm (hrg/lowlevel.py): the ramped command, its acceleration fed forward through M(q),
+        # the paper's PD on q_des = q + qd_cmd dt, gravity / Coriolis / friction / payload.
+        z_cmd, z_acc = self._ramp.at(t)
+        qd_cmd, qdd_cmd = z_cmd[:N_ARM], z_acc[:N_ARM]
+        tau_ff = (self._robot.gravity_coriolis(q, qd, self._pin_ctrl) + self.friction(qd_cmd)
                   + self._payload_torque(q))
+        if self._inertia_ff:
+            tau_ff = tau_ff + self._robot.mass_matrix(q, self._pin_ctrl) @ qdd_cmd
         kp, kd = self._kp, self._kd
         if not fresh:  # no plan: hold the joints where the plans stopped
             if self._q_stale is None:
@@ -615,34 +646,29 @@ class HRGController(BaseController):
             kp, kd = self._stale_kp, self._stale_kd
         elif self._ref_mode == "step":  # the paper: one control interval from the measured q
             self._q_stale = None
-            self._q_ref = q + self._qd_filt * self._ctrl_dt
+            self._q_ref = q + qd_cmd * self._ctrl_dt
         else:  # running integral of the commands
             self._q_stale = None
             if self._q_ref is None:
                 self._q_ref = q.copy()
-            self._q_ref = np.clip(self._q_ref + self._qd_filt * self._ctrl_dt,
-                                  q - self._max_ref_err, q + self._max_ref_err)
+            self._q_ref = np.clip(self._q_ref + qd_cmd * self._ctrl_dt, q - self._max_ref_err, q + self._max_ref_err)
         cmd = JointCtrlData(num_joints=N_ARM)
-        cmd.set_data(self._cur_time, self._q_ref.copy(), self._qd_filt.copy(), tau_ff, kp, kd)
+        cmd.set_data(t, self._q_ref.copy(), qd_cmd.copy(), tau_ff, kp, kd)
         self.ctrl_pub_que.put(cmd)
 
-        # Gripper: w_ref += wdot_des dt, streamed as move set-points.
+        # Gripper: the width rate as a stream of set-points at that speed (WidthStream).
         if gs is None:
             return
         w_meas = float(gs.width)
-        if self._w_ref is None or not self._streaming:
-            self._w_ref = w_meas
+        if not self._streaming:
+            self._wstream.start(w_meas)
             return
-        wd = self._wd_des if fresh else 0.0
-        self._w_ref = float(np.clip(self._w_ref + wd * self._ctrl_dt, 0.0, MAX_WIDTH))
-        self._w_ref = float(np.clip(self._w_ref, w_meas - self._w_lead, w_meas + self._w_lead))
-        if (self._cur_time - self._w_last_sent_t >= self._w_stream_dt
-                and (self._w_last_sent is None or abs(self._w_ref - self._w_last_sent) > 5e-4)):
+        out = self._wstream.update(float(z_cmd[N_ARM]), w_meas, self._ctrl_dt, t)
+        if out is not None:
             with self._gripper_lock:
                 if not self._streaming:
                     return
-                self._send_gripper(GripperCmdData.MOVE, self._w_ref, MAX_WIDTH_RATE, 0.0, 0.01, 0.01)
-            self._w_last_sent, self._w_last_sent_t = self._w_ref, self._cur_time
+                self._send_gripper(GripperCmdData.MOVE, out[0], out[1], 0.0, 0.01, 0.01)
 
     def friction(self, qd_cmd: np.ndarray) -> np.ndarray:
         """Friction feed-forward on the commanded joint velocities

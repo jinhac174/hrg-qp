@@ -97,7 +97,16 @@ obstacles, 1 cm for the target object).
 
 `xdot_i,des = v(x_i, x_i*) ċ0/|ċ0|` with `ċ0` the first segment of the path,
 `v = v_const` beyond `δ_x`, `v_const (1 − (1 − e/δ_x)²)` within
-(`quad_decay_speed`). `v_const = 0.15` m/s, `δ_x = 5` cm.
+(`quad_decay_speed`). **[FR3]** `v_const = 0.5` m/s, `δ_x = 10` cm (the
+paper: 0.15 m/s, 5 cm); why these, and what bounds them, is in "Speed"
+below. Near the target the decay is linear with gain `2 v_const / δ_x`
+(10 /s), so a faster `v_const` also ends faster. The direction is read
+over the first 2 cm of the path (`fields.path_direction`), not its first
+1.5 mm segment: the SQP moves the interior knots by fractions of a
+millimetre from plan to plan, and on a moving target that turned the first
+segment by tens of degrees between plans. On a moving object the targets'
+own velocity is added (feed-forward: the field alone trails a moving target
+by `v_obj / K`, 3.5 cm at 0.35 m/s).
 
 ### Eqs. (6)-(8), grasp stability — `fields.grasp_stability_field`
 
@@ -115,9 +124,17 @@ cannot occur with parallel pads (`test_grasp_stability_is_zero_on_the_parallel_j
 ### Eqs. (9)-(10), gripper posture — `fields.gripper_width_field`
 
 `wdot_des = v(w, w*) sign(w* − w)` toward the nominal open posture
-`w* = 85 mm` (`v_gr = 0.1` m/s, `δ_gr = 2` cm), weighted by
-`β(h) = ½ + ½ tanh((h − η_h)/T_h)` with `h = |x − x*|`, `η_h = 6` cm,
-`T_h = 2` cm: open far away, free to close near the target.
+`w* = 85 mm` (`v_gr = 0.15` m/s, the 2F-85's fastest, `δ_gr = 2` cm),
+weighted by `β(h) = ½ + ½ tanh((h − η_h)/T_h)` with `h = |x − x*|`,
+`η_h = 6` cm, `T_h = 2` cm: open far away, free to close near the target.
+**[2F-85]** With the oriented reach (below) the grasp is known from the
+first plan, so the posture **pre-shapes**: `w*` is the chosen targets'
+opening plus `preshape_margin` = 1 cm on each side (85 mm for the paper's
+reach). The fingers then straddle the object as the hand comes in along the
+approach and the width never limits the straight approach: closing from
+fully open to a bowl's rim takes 0.3–0.4 s at the gripper's top speed, the
+last 10 cm of approach 0.2 s. The collision rows on the finger spheres still
+decide the width where an obstacle or the object is in the way.
 
 ### Eq. (11), the QP — `planner.ReachPlanner.step`, `hrg/qp.py`
 
@@ -127,12 +144,17 @@ s.t.   Γ(q) + dΓ/dz z H >= ε_Γ                     robot vs walls / floor, r
        d(X(q,w), O) + dd/dz z H >= ε_O + r         hand spheres vs object, table, obstacles
        q_min <= q + qdot H <= q_max,  0 <= w + wdot H <= 85 mm
        |qdot| <= qdot_max,  |wdot| <= 150 mm/s
+       |z − z_prev| <= a Δt_plan                     acceleration limits (joints, width)
+(infeasible only: the two distance rows get slacks s >= 0, + ρ Σ s + |s|² in the cost)
 ```
 
 * `H = 0.10` s. Margins: object 1 cm, obstacles 2 cm, table 5 mm, Γ 2 cm.
   When a pair is already inside its margin, the demanded separation rate
   `(ε − d)/H` is capped at 0.25 m/s so the QP stays feasible while it
-  recovers.
+  recovers. **[moving object]** The object's rows carry its own motion:
+  `d + (n·J z − n·v_obj) H >= ε`, with `v_obj` the object's velocity at the
+  sphere (from the pose predictor below). Without that term a carried
+  bowl ran into a hand the rows believed was standing clear.
   **[FR3 + 2F-85]** The paper leaves `H` to the user ("`H` and the margins
   control the conservativeness"). Linearised over `H`, a distance row lets
   the hand approach its margin at up to `(d − ε)/H` and pushes it out at
@@ -145,6 +167,26 @@ s.t.   Γ(q) + dΓ/dz z H >= ε_Γ                     robot vs walls / floor, r
   whenever a reach stalls or hovers next to the object. With `H = 0.10` s
   the same state settles within 1 mm of the margin with no oscillation, and
   reaches away from any margin are unchanged (same lift times to 0.1 s).
+* **[FR3]** `|z − z_prev| <= a Δt_plan`: the velocity may change by at most
+  the joint acceleration limits `a` = [10 ×4, 15, 20, 20] rad/s² (the
+  FR3's) and 2 m/s² for the width over one plan period (`z_prev` the
+  previous plan). The paper's QP is first order: its velocity may jump,
+  and a torque-controlled arm realises the jump with a lag the rows know
+  nothing about. Bounded, the plan is a velocity profile the arm can
+  follow, and the low level (Sec. II-D) realises exactly it. See "Speed".
+* **[FR3]** The rows are solved hard first (the paper's QP). Only when that
+  is infeasible — inside a margin, the arm at rest and the acceleration
+  limit between it and the demanded separation rate, e.g. the held bowl's
+  table rows at the start of the lift — they are relaxed through slacks
+  `s >= 0` with the linear penalty `ρ Σ s`, `ρ = 100` (plus a small `|s|²`
+  that keeps OSQP converging). A linear penalty is exact: above the
+  tracking cost's gradient (at most `2 |v| ≈ 2` for a 1 m/s field) every
+  row the box allows holds with `s = 0`, so the relaxed problem has the
+  hard one's optimum whenever that exists, and otherwise returns the
+  fastest recovery the box allows instead of nothing. (Solving the slack
+  form always was slower and, with the box's 95 rows, OSQP sometimes ran
+  out of iterations.) A failed solve brakes toward rest at the acceleration
+  limit.
 * `1e-3 |z|²`: with `α = β = 0` near the target the cost constrains six of
   the eight velocities (two fingertips × 3); the regulariser picks the
   smallest motion for the rest.
@@ -172,11 +214,12 @@ s.t.   Γ(q) + dΓ/dz z H >= ε_Γ                     robot vs walls / floor, r
 
 Paper: "Given `qdot_des` from (11), we integrate over one control interval to
 obtain the desired joint position and then apply PD control with gravity
-compensation." Every 1 ms (`ref_mode: step`):
+compensation." Every 1 ms (`ref_mode: step`; `hrg/lowlevel.py`):
 
 ```
-q_des = q + qdot_des dt
-τ     = Kp (q_des − q) + Kd (qdot_des − qdot) + g(q) + C(q, qdot) qdot + τ_f(qdot_des)
+qd_cmd = the plan's qdot_des, ramped from the previous plan's over the plan period
+q_des  = q + qd_cmd dt
+τ      = Kp (q_des − q) + Kd (qd_cmd − qdot) + M(q) qdd_cmd + g(q) + C(q, qdot) qdot + τ_f(qd_cmd)
 ```
 
 * `Kp (q_des − q) = Kp dt qdot_des` is about 1 % of the Kd term (600 × 1 ms
@@ -201,13 +244,35 @@ q_des = q + qdot_des dt
 * `g(q) + C qdot` from the URDF. **[FR3]** The hardware process cancels the
   FR3's own gravity compensation (`gravity_model: controller`), so sim and
   robot see the same law.
-* **[FR3]** `qdot_des` passes a first-order filter (0.25 per tick, ~4 ms):
-  the plan changes in steps at 100 Hz and libfranka rejects torque
-  discontinuities. If no plan arrives for 0.2 s the joints are held where
-  they were (`stale_hold_kp` / `kd`).
-* **[2F-85]** The Robotiq is position-servoed (and so is its sim). `wdot_des`
-  is realised the same way, as a set-point `w_ref += wdot_des dt` kept within
-  1 cm of the measured width and streamed as `move` commands at 50 Hz.
+* **[FR3]** `M(q) qdd_cmd` (`inertia_ff`): the command's acceleration fed
+  forward through the mass matrix. The Kd loop alone follows a velocity
+  command with the time constant `M_ii / Kd_i`: 30–60 ms on joints 1–4 at
+  the gains that are quiet on the robot (measured 25–31 ms lag on joints 2
+  and 4, `scripts/diagnose_tracking.py`). That lag is what the horizon had
+  to cover, and at speed it is the distance `v × lag` by which a margin is
+  overshot. With the feed-forward the arm follows the planned velocity
+  profile by construction and `Kd` only corrects errors: the lag falls to
+  2–9 ms on every joint (the plan period), and the plans change by at most
+  the acceleration limits per period (eq. 11), so the ramp's acceleration is
+  what the robot can do and the torque has no steps (libfranka rejects
+  them). The earlier first-order filter on `qdot_des` is gone: the ramp
+  between plans is the filter, and it is exact. If no plan arrives for
+  0.2 s the joints are held where they were (`stale_hold_kp` / `kd`).
+* **[2F-85]** The Robotiq is position-servoed (and so is its sim), with a
+  speed setting per command. `wdot_des` is realised as a stream of `move`
+  set-points at 50 Hz, each a little ahead (`|wdot| × 2 periods`, at least
+  1 mm) of the integrated width `w_ref` (kept within 1 cm of the measured
+  width: no wind-up against a blocked finger) **at the speed `|wdot_des|`**
+  (`lowlevel.WidthStream`). The fingers then move continuously at the
+  commanded rate. The earlier stream sent each set-point at the gripper's
+  full speed: the fingers raced to it and waited for the next one (a third
+  of the stream stopped, measured), the twitching seen on the robot. The
+  simulated gripper, for its part, restarted its set-point ramp at the
+  (lagging) measured width on every streamed command, which left the servo
+  3 mm ahead of the fingers per period and the fingers creeping at 17 mm/s
+  whatever speed was asked for: that, not the controller, made every
+  grasp in sim wait a second with the hand at the targets. It now
+  re-targets a running motion like the real one.
 
 ### Grasp and lift — `controller.HRGController._plan`
 
@@ -219,13 +284,17 @@ object is lifted."
 * Trigger: both fingertips within 1 cm (sim) / 1.5 cm (robot,
   `configs/robot/controller.yaml`).
 * **[2F-85]** The Robotiq takes its grip force before it closes: a `grasp`
-  command at 30 N. It succeeds if the fingers stop on something, between half
+  command at 30 N and the gripper's top speed (0.15 m/s; from the
+  pre-shaped opening the pads meet the object after 2 cm, 0.15 s). While it
+  closes the hand holds its pose relative to the object (a moving object is
+  followed; see "Speed"). It succeeds if the fingers stop on something, between half
   the contact width and just inside the pre-grasp opening; otherwise the
   gripper opens and the reach starts again. If the object is lost during the
   lift or hold, the same happens.
 * Lift: the TCP 15 cm straight up through the same QP (a pose field as the
-  task; `Γ` and the hand vs table / obstacles as constraints, plus 64 points
-  of the held object vs the table), then (not in the paper) **upright**: the
+  task, saturated at 0.8 m/s with gain 8 /s; `Γ` and the hand vs table /
+  obstacles as constraints, plus 64 points of the held object vs the
+  table; 0.4 s), then (not in the paper) **upright**: the
   hand pose that puts the object back in its upright pose (object `+z` up,
   the smallest tilt about the TCP, raised until it clears the table by
   3 cm), from the object's pose in the hand recorded when the gripper
@@ -297,10 +366,94 @@ R* = R_obj R_grasp,j,k (· Rz(π) for the other finger order)
 |---|---|
 | Selection weight `w` (eq. 12) | 0.05 m/rad |
 | `K` (eq. 2) | 1 /s |
-| `η_g, T_g, η_h, T_h, δ_gr, v_gr` | 0.15 rad, 0.05, 6 cm, 2 cm, 2 cm, 0.1 m/s |
-| `H`, margins | 0.10 s (above the ~40 ms closed-loop latency, see eq. 11); object 1 cm (paper), obstacles 5 cm in eq. (3) (paper), 2 cm in eq. (11) |
+| `η_g, T_g, η_h, T_h, δ_gr, v_gr` | 0.15 rad, 0.05, 6 cm, 2 cm, 2 cm, 0.15 m/s |
+| `v_const`, `δ_x` (eq. 5) | 0.8 m/s, 8 cm (the paper: 0.15 m/s, 5 cm); see "Speed" |
+| `H`, margins | 0.10 s (the stopping time: `v <= a H`, see "Speed"); object 1 cm (paper), obstacles 5 cm in eq. (3) (paper), 2 cm in eq. (11) |
+| Acceleration limits (not in the paper) | the FR3's [10 ×4, 15, 20, 20] rad/s², the width 2 m/s² |
 | Start poses "left-bottom, center-up, right-bottom" | `hrg/study.py`: the ready pose, and the gripper pointing down 27 cm to either side with the fingertips at rim height |
-| GPU nearest-neighbour / via search | CPU (KD-tree, NumPy); plans take 7–15 ms |
+| GPU nearest-neighbour / via search | CPU (KD-tree, NumPy); plans take 3–15 ms |
+
+## Speed: how the velocity is made, what sets it, what bounds it
+
+The method is first order: every plan **creates** a velocity from fields
+and the QP picks the joint velocity that tracks them under the constraints.
+Nothing else decides how fast the arm goes.
+
+**Created by the fields.** The fingertip field (eq. 5): `v_const` far from
+the target, decaying over `δ_x`, linear near the target with gain
+`K = 2 v_const / δ_x`. The alignment (oriented reach): `k θ` capped at
+`ω_max` (3 /s, 1.5 rad/s). The posture task toward `q_grasp` (3 /s). The
+width field (eq. 9, 0.15 m/s). After the grasp: the lift's pose field
+(0.8 m/s, 8 /s; 2 rad/s, 5 /s), the hold (10 /s, 1 rad/s), home (2 /s).
+Raising these is what makes the robot move faster; everything below only
+says how far they can be raised.
+
+**Bounded by the QP (eq. 11).** The joint velocity limits (2 rad/s on
+joints 1–4, 2.5 on the wrist; the hardware brakes above 2 / 3) are not
+binding below about 1 m/s of hand speed. The distance rows are: linearised
+over `H`, a row lets the hand approach a margin at `(d − ε)/H`, so the hand
+starts braking `v H` before any margin (5 cm at 0.5 m/s) and then closes in
+with the time constant `H`. The required deceleration is `v/H`, so the
+rows are only satisfiable while **`v <= a H`**, with `a` the hand's
+acceleration (5–8 m/s² at the FR3's joint acceleration limits over the
+arm's lever). And the eq. (5) decay itself must be feasible: its peak
+deceleration is about `1.5 v_const² / δ_x`, 3.8 m/s² at 0.5 m/s and 10 cm.
+(0.8 m/s with 8 cm asks for 12 m/s²: the plans then ride the acceleration
+bounds and the arm visibly shakes; `v_const` was lowered from 0.8 to 0.5
+for that reason, at a cost of 0.25 s on a reach.) The acceleration bounds
+in the QP are what makes this consistent: without them the QP's velocity
+could jump and the rows could demand more braking than the arm has; with
+them, and the slack fallback, the QP always returns the fastest motion the
+arm can make.
+
+**Realised by the low level (Sec. II-D).** The velocity ramp between plans
+and the inertia feed-forward make the arm follow the planned velocity
+profile with 2–9 ms of lag (measured; 25–31 ms on joints 2 and 4 before,
+the `M / Kd` time constant). The lag no longer sets `H`: `H` is the
+stopping time above. A faster robot would come from a larger `a H`, i.e.
+from more acceleration (the FR3's limits) or a longer horizon (braking
+earlier).
+
+**A moving object.** Five things had to hold for a carried object to be
+followed without the arm shaking, each found by replaying a recorded carry
+through the planner and counting the plans at the acceleration bounds:
+
+1. The final-approach goal is continuous (`fields.corridor`): the path's
+   end slides along the approach segment with the hand's alignment instead
+   of switching between "to the pre-grasp" and "to the target" (the switch,
+   with hysteresis, flipped several times a second on a moving object).
+2. That goal is never behind the hand along the approach: a hand lagging a
+   moving object had overshot the pre-grasp and was sent back to it every
+   plan.
+3. The path direction is read over 2 cm, not the first 1.5 mm segment
+   (eqs. 4–5 above).
+4. The object pose is extrapolated at its estimated velocity between
+   perception frames (`lowlevel.PosePredictor`; 30 Hz in sim, ~24 Hz on
+   the robot): held, the targets stepped every 3–4 plans and each step was
+   answered at the acceleration bounds (plans at the bounds: 0.15–0.19 of
+   them held, 0.07–0.12 extrapolated, the same as with the true pose).
+5. The object's velocity enters the fields (target feed-forward) and its
+   collision rows (drift), and while the fingers close the hand keeps its
+   pose **relative to the object** (the lift's pose field toward
+   `T_obj · T_obj⁻¹T_tcp|trigger`, without the object's rows): with the arm
+   holding still for the 0.3 s close a moving object ran into the palm, and
+   with the reach's fingertip tasks and object rows kept on, the closing
+   pads dragged the hand sideways and tipped boxes over.
+
+Beyond these, a chase at 0.35 m/s keeps the plans at the bounds 7–12 % of
+the time (the bounds are doing their job), the arm follows with 0.05–0.1
+rad/s of velocity error, and the carrier's release (the simulated hand-over
+letting go when both pads hold the object) is the one remaining impulse.
+
+**What is not in the chain.** The planner at 100 Hz (3–8 ms per plan,
+8–13 ms with obstacles). On the robot FoundationPose at 24 Hz, with its
+~60 ms filter lag, is the slowest link for a moving object, not the arm;
+the predictor covers the frame interval, not the filter lag.
+
+Measured in the real-time simulation (`scripts/diagnose_tracking.py`,
+`docs/results.md`): the gold bowl from the left-bottom start is grasped
+1.0 s after `v` (gripper close included) and lifted 0.5 s later; before
+this work, 4.0 s and 1.3 s.
 
 ## Known limitations
 

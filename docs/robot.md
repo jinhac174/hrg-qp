@@ -262,11 +262,23 @@ Objects for the real experiments (paper Sec. III-B): `blue_bowl`, `red_cup`,
 
 ## 5. To check on the robot
 
-* **Gripper streaming.** While reaching, the width is streamed as `move`
-  set-points at `width_stream_freq` (50 Hz); `run_hardware.py` lets a new
-  `move` preempt the running one. Check how fast the 2F-85 follows over
-  RS-485 (and the NUC bridge). If it lags, lower `width_stream_freq` or raise
-  `width_max_lead`.
+* **Gripper streaming.** While reaching, the width rate is streamed as
+  `move` set-points at `width_stream_freq` (50 Hz), each a little ahead of
+  the integrated width **at the speed of the commanded rate** (the speed
+  byte of the Modbus request; `hrg/lowlevel.py`), so the fingers move
+  continuously instead of racing to every set-point at full speed and
+  waiting (the twitch seen earlier). `run_hardware.py` lets a new `move`
+  preempt the running one. If the gripper still steps, the RS-485 round
+  trip (NUC bridge) is the limit: lower `width_stream_freq` to 25 Hz (the
+  lead grows with the period, the motion stays continuous).
+* **Speed.** The defaults are now fast (`hrg.v_const` 0.8 m/s, lift 0.8 m/s,
+  the FR3's acceleration limits; docs/method.md "Speed"). Start on the robot
+  with `--hrg.v_const 0.3 --grasp.lift_speed 0.3` and raise them. What to
+  watch: the FR3's collision reflex (external-torque estimate; model errors
+  grow with acceleration; thresholds in `hardware.yaml`), the velocity brake
+  (`max_joint_vel`), and the gripper stream above. `scripts/diagnose_tracking.py`
+  is for the sim; on the robot compare `qd_des` with `qd` from a recorded
+  bus the same way.
 * **Trigger.** 1.5 cm (the paper's robot value) absorbs pose-estimation
   noise; watch the fingertip error the controller prints when it closes.
 * **The cell.** The controller's walls (`configs/robot/controller.yaml`,
@@ -282,3 +294,14 @@ Objects for the real experiments (paper Sec. III-B): `blue_bowl`, `red_cup`,
   the controller dies, `run_hardware.py`'s own hold takes over. To compare
   with the earlier stiff tracking: `--ref_mode integral --kp
   [600,600,600,600,250,150,50]`.
+* **Moving objects.** The controller extrapolates the object pose between
+  FoundationPose frames at its estimated velocity (`object_pose_predict`)
+  and feeds that velocity to the fields and the collision rows. With the
+  pose filter's ~60 ms lag the hand will trail a moving object by that
+  much; `--object_pose_predict false` if the estimate is noisy (a resting
+  object then jitters by its pose noise, which is the same either way).
+* **Inertia feed-forward.** `M(q) qdd_cmd` from the URDF is added to the
+  torque (`inertia_ff: true`). A wrong link mass shows as a velocity error
+  during accelerations, not as a steady sag. `--inertia_ff false` is the
+  paper's plain PD; the arm then lags the plan by 30–60 ms on the big
+  joints, which is what `H = 0.10` s was first chosen for.

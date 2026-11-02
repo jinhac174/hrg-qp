@@ -1,0 +1,9 @@
+# The object carried through the air for longer (env key m, hrg/carry.py), for the demo:
+#   python scripts/record_video.py --env configs/sim/env_carry.yaml --object gold_bowl --carry_at 0.5
+carry:
+  box: [[0.35, 0.58], [-0.30, 0.30], [0.08, 0.33]]   # within comfortable reach: a 15 cm lift must still fit
+  waypoints: 6
+  speed: 0.35              # m/s
+  yaw_range: 1.2           # rad, each way
+  min_duration: 7.0        # s
+  seed: 0

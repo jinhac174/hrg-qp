@@ -51,11 +51,12 @@ def make_planner(obj: str, field: str, overrides=()) -> tuple[ReachPlanner, Gras
     cfg.hrg.field = field
     o = GraspObject(f"configs/objects/{obj}.yaml")
     robot = RobotModel(cfg.urdf_path, cfg.joint_velocity_limit, cfg.col_pairs, cfg.self_col_pairs,
-                       cfg.env_col_margin, cfg.self_col_margin)
+                       cfg.env_col_margin, cfg.self_col_margin, cfg.get("joint_acceleration_limit"))
     robot.set_collision_geometry(*scene_collision_info(OmegaConf.load(resolve(ENV_CFG)).scene_xml_path))
     planner = ReachPlanner(HRGParams.from_config(cfg.hrg), robot,
                            FingertipTargets.load(resolve(o.cfg.fingertip_targets), o.cfg.get("approach_axis")),
-                           sdf_from_config(o.cfg.sdf), table_z=float(cfg.grasp.table_z))
+                           sdf_from_config(o.cfg.sdf), table_z=float(cfg.grasp.table_z),
+                           plan_dt=1.0 / float(cfg.plan_freq), width_accel=float(cfg.get("width_acceleration_limit", 2.0)))
     return planner, o
 
 
@@ -81,6 +82,7 @@ def rollout(planner: ReachPlanner, q0, T_obj, horizon: float, dt: float, tol: fl
     """``rot_tol``: with the oriented reach, the hand must also be this close
     to its target orientation (the controller's ``grasp_trigger_rot``)."""
     planner.reset()
+    planner.set_velocity(np.zeros(7))  # from rest
     q0 = np.asarray(q0, dtype=float)
     q, w = q0.copy(), MAX_WIDTH
     data = planner.robot.data()

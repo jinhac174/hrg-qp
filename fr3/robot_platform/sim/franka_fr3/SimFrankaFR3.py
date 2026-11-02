@@ -145,7 +145,13 @@ class _GripperSim:
         self._pending_seq = cmd.seq
         self.stall_t = 0.0
         self.grasp_held = False
-        self.width_ref = width
+        # The set-point ramp continues from where it is, not from the measured
+        # width: the real gripper re-targets a running motion without a reset.
+        # Restarting the ramp at the (lagging) measured width on every streamed
+        # set-point left the servo only ~3 mm ahead of the fingers per period,
+        # and the fingers crept at ~17 mm/s whatever speed was asked for.
+        if not self.busy:
+            self.width_ref = width
 
         mode = cmd.mode
         if mode == GripperCmdData.STOP:

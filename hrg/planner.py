@@ -59,6 +59,7 @@ from hrg.fields import (
     tanh_weight,
 )
 from hrg.hand import (
+    MAX_WIDTH_ACCEL,
     MAX_WIDTH,
     MAX_WIDTH_RATE,
     N_ARM,
@@ -99,9 +100,9 @@ class HRGParams:
     """The method's parameters (``hrg:`` section of ``configs/controller.yaml``)."""
 
     field: str = "path"  # path: eqs. (3)-(5); linear: the eq. (2) baseline
-    # eq. (5)
-    v_const: float = 0.15
-    delta_x: float = 0.05
+    # eq. (5); docs/method.md "Speed": v_const <= a H (the braking the collision rows can ask for)
+    v_const: float = 0.5
+    delta_x: float = 0.10
     # eq. (2) baseline
     linear_gain: float = 1.0
     # eq. (3)
@@ -121,8 +122,12 @@ class HRGParams:
     T_g: float = 0.05
     # eqs. (9)-(10)
     w_nominal: float = MAX_WIDTH
-    v_gr: float = 0.10
+    v_gr: float = MAX_WIDTH_RATE
     delta_gr: float = 0.02
+    # the posture field's opening once a grasp is chosen (the oriented reach): the targets'
+    # opening + this on each side, so the fingers straddle the object as they come in and
+    # the width does not limit the straight approach. 0: the paper's w_nominal throughout.
+    preshape_margin: float = 0.01
     eta_h: float = 0.06
     T_h: float = 0.02
     # eq. (11)
@@ -135,12 +140,12 @@ class HRGParams:
     # the oriented reach (docs/superpowers/specs/2026-10-28-oriented-reach-design.md)
     orient: bool = True  # false: the paper's reach (fingertip points only)
     rot_weight: float = 0.1  # alpha's full weight
-    rot_gain: float = 2.0  # 1/s, k in w_des = sat(k (R n_b) x n_t, rot_max)
-    rot_max: float = 1.0  # rad/s
-    rot_threshold: float = 30.0  # deg: alpha full above, linear to 0 below (2 sin 30 deg = the cap)
+    rot_gain: float = 3.0  # 1/s, k in w_des = sat(k (R n_b) x n_t, rot_max)
+    rot_max: float = 1.5  # rad/s
+    rot_threshold: float = 30.0  # deg: alpha full above, linear to 0 below (3 sin 30 deg = the cap)
     approach_dist: float = 0.10  # m, straight final approach along z*
     posture_weight: float = 0.05  # the chosen grasp configuration, joint space
-    posture_gain: float = 1.0  # 1/s
+    posture_gain: float = 3.0  # 1/s
     select_w_pref: float = 2.0  # rad of joint motion per rad off the object's preferred approach
     select_shortlist: int = 6  # new candidates solved by IK per plan
 
@@ -157,13 +162,27 @@ class HRGParams:
 
 
 class ReachPlanner:
+    """One plan per call (``step`` / ``lift_step`` / ``home_step``), each the
+    QP of eq. (11) with a different task. Every call is also bounded by the
+    joint and width **acceleration limits** over the plan period
+    (``plan_dt``): ``|z - z_prev| <= a plan_dt`` with ``z_prev`` the previous
+    plan. The paper's QP has no acceleration bound: its velocity may jump,
+    and a torque-controlled arm realises the jump with a lag the collision
+    rows (linearised over ``H``) know nothing about. Bounded, the command is
+    a velocity profile the arm can follow (``hrg.lowlevel``), and the rows
+    stay feasible as long as ``v <= a H`` (docs/method.md, "Speed")."""
+
     def __init__(self, params: HRGParams, robot: RobotModel, targets: FingertipTargets,
-                 obj_sdf: PosedSDF, table_z: float = 0.0):
+                 obj_sdf: PosedSDF, table_z: float = 0.0, plan_dt: float = 0.01,
+                 width_accel: float = MAX_WIDTH_ACCEL):
         self.p = params
         self.robot = robot
         self.targets = targets
         self.obj_sdf = obj_sdf
         self.table = HalfSpaceSDF(table_z)
+        self.plan_dt = float(plan_dt)
+        self.z_accel = np.r_[robot.qdd_limit, float(width_accel)]  # (8,) acceleration limits of z
+        self._z_prev = None  # the previous plan (acceleration anchor); None: at rest / unknown
         self.path_field = FingertipPathField(
             v_const=params.v_const, delta_x=params.delta_x, num_knots=params.num_knots,
             num_via_samples=params.num_via_samples, via_dist=params.via_dist,
@@ -186,15 +205,39 @@ class ReachPlanner:
         self._ik_cache.clear()
         self._choice = None
         self._q_grasp = None
+        self._z_prev = None  # at rest, unless set_velocity says otherwise
+
+    def set_velocity(self, qd, wd: float = 0.0) -> None:
+        """The acceleration anchor for the next plan: the velocity the arm
+        actually has (the first plan after a pause, a push, a new controller)."""
+        self._z_prev = np.r_[np.asarray(qd, dtype=float), float(wd)]
+
+    def _finish(self, z, ok: bool) -> np.ndarray:
+        """Record the plan as the next acceleration anchor. A failed QP
+        (``ok`` False) decelerates from the previous plan at the limit
+        instead of stopping dead."""
+        if not ok:  # brake toward rest at the acceleration limit
+            prev = np.zeros(N_Z) if self._z_prev is None else self._z_prev
+            z = prev - np.clip(prev, -self.z_accel * self.plan_dt, self.z_accel * self.plan_dt)
+        self._z_prev = np.asarray(z, dtype=float).copy()
+        return self._z_prev.copy()
 
     def tcp_pose(self, q: np.ndarray) -> np.ndarray:
         return self.robot.pose(q, self._data)
 
     # ------------------------------------------------------------ reach
-    def step(self, q: np.ndarray, w: float, T_obj: np.ndarray, obstacles=()) -> ReachStep | None:
+    def step(self, q: np.ndarray, w: float, T_obj: np.ndarray, obstacles=(), obj_twist=None) -> ReachStep | None:
         """One plan at joints ``q``, width ``w``, object pose ``T_obj``;
-        ``obstacles``: posed ``hrg.sdf`` shapes. ``None`` if no target is valid."""
+        ``obstacles``: posed ``hrg.sdf`` shapes; ``obj_twist``: the object's
+        ``(v (3,), omega (3,))`` in the world (a carried object; ``None`` at
+        rest). The targets then move with it, which the fingertip fields
+        get as a feed-forward (``xdot_des + v_target``: the field alone
+        trails a moving target by ``v / K``), and its collision rows know it
+        is coming (``DistanceRows.add(drift=...)``). ``None`` if no target
+        is valid."""
         p = self.p
+        v_obj, om_obj = (np.zeros(3), np.zeros(3)) if obj_twist is None else (np.asarray(obj_twist[0], float),
+                                                                               np.asarray(obj_twist[1], float))
         T_tcp = self.robot.pose(q, self._data)
         J_tcp = self.robot.jacobian(q, self._data)
 
@@ -228,12 +271,17 @@ class ReachPlanner:
                 h = self.path_field.h_pre  # the opening is the targets' from the pre-grasp on
         else:
             xd_des = linear_fingertip_field(x, x_tgt, p.linear_gain)
+        if obj_twist is not None:  # the targets ride on the object: feed their velocity forward
+            xd_des = xd_des + v_obj + np.cross(om_obj, x_tgt - T_obj[:3, 3])
 
         # 4. auxiliary fields; both pads are fixed in the TCP frame
         omega_des, g = grasp_stability_field(x, np.stack([T_tcp[:3, :3]] * 2), PAD_CONTACT_AXES)
         alpha = float(tanh_weight(g, p.eta_g, p.T_g))
         beta = float(tanh_weight(h, p.eta_h, p.T_h))
-        wd_star = gripper_width_field(w, p.w_nominal, p.v_gr, p.delta_gr)
+        w_nom = p.w_nominal
+        if R_star is not None and p.preshape_margin > 0.0:  # pre-shape for the chosen grasp
+            w_nom = min(MAX_WIDTH, float(np.linalg.norm(x_tgt[1] - x_tgt[0])) + 2.0 * p.preshape_margin)
+        wd_star = gripper_width_field(w, w_nom, p.v_gr, p.delta_gr)
 
         # 5. QP (eq. 11)
         S = np.zeros((1, N_Z))
@@ -251,11 +299,11 @@ class ReachPlanner:
                 tasks.append((Jq, p.posture_gain * (self._q_grasp - q), p.posture_weight))
         tasks.append((S, [wd_star], beta))
         lb, ub = self._bounds(q, w)
-        rows = self._rows(q, T_tcp, J_tcp, w, obstacles, with_object=True)
+        rows = self._rows(q, T_tcp, J_tcp, w, obstacles, with_object=True,
+                          obj_twist=None if obj_twist is None else (v_obj, om_obj, T_obj[:3, 3]))
         z = solve_tracking_qp(tasks, lb, ub, rows, reg=p.qp_reg)
         ok = z is not None
-        if not ok:
-            z = np.zeros(N_Z)
+        z = self._finish(z, ok)
         return ReachStep(
             qd=z[:N_ARM].copy(), wd=float(z[N_ARM]), x=x, x_tgt=x_tgt, target=j, swapped=swap,
             contact_width=float(tg.contact_width[j]), paths=paths, qp_ok=ok,
@@ -434,7 +482,7 @@ class ReachPlanner:
         if held is not None and len(held):
             self.held_rows(T, J, held, held_eps, rows)
         z = solve_tracking_qp([(J6, W * np.r_[om, v], 1.0)], lb, ub, rows, reg=self.p.qp_reg)
-        return np.zeros(N_ARM) if z is None else z[:N_ARM].copy()
+        return self._finish(z, z is not None)[:N_ARM]
 
     def held_rows(self, T_tcp: np.ndarray, J_tcp: np.ndarray, P_tcp: np.ndarray, eps: float,
                   rows: DistanceRows, reach: float = 0.15) -> None:
@@ -469,30 +517,51 @@ class ReachPlanner:
         T[2, 3] = max(T[2, 3], self.table.z0 + clearance - z_low)
         return T, tilt
 
-    def home_step(self, q: np.ndarray, w: float, q_home: np.ndarray, gain: float):
-        """Joint velocities toward ``q_home`` (``gain (q_home - q)``) under
-        the same constraints as ``lift_step``."""
+    def home_step(self, q: np.ndarray, w: float, q_home: np.ndarray, gain: float, vmax: float | None = None):
+        """Joint velocities toward ``q_home`` (the joint field ``gain (q_home
+        - q)``, its norm saturated at ``vmax`` if given) under the same
+        constraints as ``lift_step``. Also the holding states' field."""
         T = self.robot.pose(q, self._data)
         J = self.robot.jacobian(q, self._data)
         Jq = np.zeros((N_ARM, N_Z))
         Jq[:, :N_ARM] = np.eye(N_ARM)
         lb, ub = self._bounds(q, w)
         lb[N_ARM] = ub[N_ARM] = 0.0
-        z = solve_tracking_qp([(Jq, gain * (q_home - q), 1.0)], lb, ub,
-                              self._rows(q, T, J, w, (), with_object=False), reg=self.p.qp_reg)
-        return np.zeros(N_ARM) if z is None else z[:N_ARM].copy()
+        v = gain * (q_home - q)
+        if vmax is not None:
+            v = _saturate(v, vmax)
+        z = solve_tracking_qp([(Jq, v, 1.0)], lb, ub, self._rows(q, T, J, w, (), with_object=False),
+                              reg=self.p.qp_reg)
+        return self._finish(z, z is not None)[:N_ARM]
 
     # ------------------------------------------------------------ QP pieces
     def _bounds(self, q, w):
+        """The box on ``z``: velocity limits, the position limits reached
+        within ``H``, and the acceleration limits over the plan period from
+        the previous plan (``z_prev``, if any). When a velocity limit shrinks
+        below the acceleration box (a joint already past its limit, braking)
+        the acceleration box wins on that side: braking is never bounded."""
         H = max(self.p.horizon, 1e-4)
         lb, ub = np.zeros(N_Z), np.zeros(N_Z)
         lb[:N_ARM], ub[:N_ARM] = self.robot.velocity_bounds(q, H)
         wc = float(np.clip(w, 0.0, MAX_WIDTH))
         lb[N_ARM] = max(-MAX_WIDTH_RATE, (0.0 - wc) / H)
         ub[N_ARM] = min(MAX_WIDTH_RATE, (MAX_WIDTH - wc) / H)
-        return lb, ub
+        z_prev = np.zeros(N_Z) if self._z_prev is None else self._z_prev
+        da = self.z_accel * self.plan_dt
+        lb_a, ub_a = z_prev - da, z_prev + da
+        lo, hi = np.maximum(lb, lb_a), np.minimum(ub, ub_a)
+        # the previous plan may sit outside today's velocity box (a position limit that
+        # moved in, a width limit): then brake toward the box at the acceleration limit,
+        # i.e. take the acceleration box's edge nearest the velocity box
+        bad = hi < lo
+        lo[bad] = np.where(z_prev[bad] > ub[bad], lb_a[bad], ub_a[bad])
+        hi[bad] = lo[bad]
+        return lo, hi
 
-    def _rows(self, q, T_tcp, J_tcp, w, obstacles, with_object: bool) -> DistanceRows:
+    def _rows(self, q, T_tcp, J_tcp, w, obstacles, with_object: bool, obj_twist=None) -> DistanceRows:
+        """``obj_twist``: ``(v, omega, p_obj)`` of a moving target object: its
+        rows get the drift ``n . v_point`` (the object closing in on its own)."""
         p = self.p
         rows = DistanceRows(N_Z, p.horizon, p.sep_rate_max)
         if self.robot.has_collision_geometry:
@@ -504,7 +573,12 @@ class ReachPlanner:
         shapes += [(f"obstacle{k}", o, p.qp_eps_obs) for k, o in enumerate(obstacles)]
         for name, sdf, eps in shapes:
             d, grad = sdf.dist_grad(C)
-            rows.add(d, np.einsum("ki,kij->kj", grad, JC), eps + r, [f"{name}:sphere{i}" for i in range(len(C))])
+            drift = None
+            if name == "object" and obj_twist is not None:
+                v, om, p_obj = obj_twist
+                drift = np.einsum("ki,ki->k", grad, v + np.cross(om, C - p_obj))  # (the sphere centre stands in for the nearest point)
+            rows.add(d, np.einsum("ki,kij->kj", grad, JC), eps + r, [f"{name}:sphere{i}" for i in range(len(C))],
+                     drift=drift)
         return rows
 
     def binding(self, q, rows: DistanceRows, tol: float = 1e-3, joint_tol: float = 0.02) -> dict:

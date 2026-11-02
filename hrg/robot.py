@@ -36,6 +36,8 @@ from hrg.paths import resolve
 from hrg.qp import DistanceRows
 
 TCP_LINK = "fr3_gripper_tcp"
+# rad/s^2, the FR3's joint acceleration limits (datasheet); config joint_acceleration_limit
+FR3_QDD_LIMIT = (10.0, 10.0, 10.0, 10.0, 15.0, 20.0, 20.0)
 
 
 def _pad(A7: np.ndarray) -> np.ndarray:
@@ -63,13 +65,15 @@ class RobotModel:
     """One Pinocchio ``Data`` per user thread: ``data()`` makes a new one."""
 
     def __init__(self, urdf_path: str, joint_velocity_limit, env_pairs=(), self_pairs=(),
-                 env_margin: float = 0.02, self_margin: float = 0.02):
+                 env_margin: float = 0.02, self_margin: float = 0.02, joint_acceleration_limit=None):
         self.model = pin.buildModelFromUrdf(resolve(urdf_path))
         if self.model.nq != N_ARM:
             raise ValueError(f"{urdf_path}: expected {N_ARM} joints, got {self.model.nq}")
         self.q_lower = self.model.lowerPositionLimit.copy()
         self.q_upper = self.model.upperPositionLimit.copy()
         self.qd_limit = np.asarray(joint_velocity_limit, dtype=float)
+        self.qdd_limit = np.asarray(FR3_QDD_LIMIT if joint_acceleration_limit is None else joint_acceleration_limit,
+                                    dtype=float)
         self.env_pairs = [tuple(p) for p in env_pairs]
         self.self_pairs = [tuple(p) for p in self_pairs]
         self.env_margin = float(env_margin)
@@ -89,6 +93,11 @@ class RobotModel:
         return get_link_Jacobian(q, self.model, data, link)
 
     # ------------------------------------------------------------ dynamics
+    def mass_matrix(self, q, data) -> np.ndarray:
+        """``M(q)`` (7x7, symmetric)."""
+        M = pin.crba(self.model, data, q)
+        return np.triu(M) + np.triu(M, 1).T
+
     def gravity_coriolis(self, q, qd, data) -> np.ndarray:
         """``g(q) + C(q, qdot) qdot``."""
         g = pin.computeGeneralizedGravity(self.model, data, q)

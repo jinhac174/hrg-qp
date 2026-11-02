@@ -28,6 +28,36 @@ from hrg.paths import REPO
 PY = sys.executable
 
 
+def _child_setup() -> None:
+    """New session, and the default signal dispositions: a parent started in
+    the background (``nohup``, a non-interactive shell's ``&``) has SIGHUP /
+    SIGINT ignored, and the children would inherit that and outlive it."""
+    os.setsid()
+    for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM):
+        signal.signal(sig, signal.SIG_DFL)
+
+
+def _descendants(pid: int) -> list[int]:
+    """Every descendant of ``pid`` (via ``pgrep -P``), children first."""
+    out = subprocess.run(["pgrep", "-P", str(pid)], check=False, capture_output=True, text=True).stdout.split()
+    kids = [int(x) for x in out]
+    for k in list(kids):
+        kids += _descendants(k)
+    return kids
+
+
+def _alive(pids) -> bool:
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            return True
+        return True
+    return False
+
+
 class Proc:
     def __init__(self, args, log_path: str):
         self.log_path = log_path
@@ -37,7 +67,7 @@ class Proc:
         else:  # util-linux script
             argv = ["script", "-qfec", " ".join([PY, *args]), "/dev/null"]
         self.p = subprocess.Popen(argv, cwd=REPO, stdout=self._log, stderr=subprocess.STDOUT,
-                                  stdin=subprocess.PIPE, preexec_fn=os.setsid)
+                                  stdin=subprocess.PIPE, preexec_fn=_child_setup)
 
     def key(self, keys: str) -> None:
         self.p.stdin.write(keys.encode())
@@ -48,14 +78,26 @@ class Proc:
             return f.read()
 
     def stop(self) -> None:
+        """SIGINT the wrapper and every descendant (a clean exit: the
+        controller / env catch KeyboardInterrupt), then SIGKILL whatever is
+        left. ``script`` runs the command in a new session behind a pty, so
+        the wrapper's process group does not contain it: the descendants are
+        found by parent pid. A leftover env + controller pair would keep
+        publishing on the bus and wreck every later trial."""
+        pids = [self.p.pid, *_descendants(self.p.pid)]
         for sig, wait in ((signal.SIGINT, 2.0), (signal.SIGKILL, 0.5)):
-            try:
-                os.killpg(self.p.pid, sig)
-            except (ProcessLookupError, PermissionError):  # already gone (macOS: EPERM)
-                break
+            for pid in pids:
+                try:
+                    os.kill(pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    pass
             t0 = time.time()
-            while time.time() - t0 < wait and self.p.poll() is None:
+            while time.time() - t0 < wait and (self.p.poll() is None or _alive(pids[1:])):
                 time.sleep(0.05)
+        try:
+            self.p.wait(timeout=1.0)
+        except Exception:  # noqa: BLE001
+            pass
         for f in (self.p.stdin, self._log):
             try:
                 f.close()

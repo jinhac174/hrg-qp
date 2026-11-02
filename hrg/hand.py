@@ -42,6 +42,9 @@ N_ARM = 7
 N_Z = N_ARM + 1  # QP decision variables: 7 joint velocities + the width rate
 MAX_WIDTH = rq.MAX_WIDTH  # fully open (m)
 MAX_WIDTH_RATE = rq.SPEED_RANGE[1]  # m/s, the 2F-85's fastest finger speed
+# m/s^2, the width acceleration the planner may ask for (full speed within ~75 ms: what the
+# position-servoed fingers do on a set-point); config width_acceleration_limit
+MAX_WIDTH_ACCEL = 2.0
 TCP_Z = rq.TCP_Z  # fr3_gripper -> fr3_gripper_tcp along z (m)
 FINGER_SIGN = np.array([-1.0, 1.0])  # y side of fingertip 1 (left) / 2 (right)
 # Axis of each pad's contact surface (its inward normal), TCP frame: the left

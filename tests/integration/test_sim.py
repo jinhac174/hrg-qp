@@ -54,3 +54,37 @@ def test_linear_field_is_stuck_beside_the_mug(procs):
     ok, log = _run(procs, "linear", 20)
     assert not ok, "the eq. (2) baseline was expected to stop short of the rim"
     assert "reach -> close" not in log
+
+
+def test_carried_object_is_grasped_where_it_is_held_out(procs):
+    """Env key ``m``: the bowl is carried along a smooth path through the air
+    and held out; the controller follows it and grasps it there, the carrier
+    lets go when both pads are on it, and the bowl is lifted and held."""
+    obj = "configs/objects/gold_bowl.yaml"
+    with Listener(CHANNELS) as lst:
+        env = procs.start("env", "run_env.py", "--config", "configs/sim/env.yaml", "--vis_mode", "vis_off",
+                          "--object_config", obj, "--obj_spawn_seed", "1")
+        assert lst.wait_for(lambda: "franka_object_pose" in lst.last, STARTUP), "env did not publish"
+        lst.spin(1.0)
+        ctrl = procs.start("ctrl", "run_controller.py", "--config", "configs/controller.yaml", "--object_config", obj)
+        assert lst.wait_for(lambda: lst.count["franka_arm_joint_ctrl"] > 500, STARTUP), "no controller"
+        ctrl.key("v")
+        lst.spin(0.5)
+        env.key("m")
+        assert lst.wait_for(lambda: "Carry:" in env.log(), 5), env.log()[-2000:]
+        z_hist = []
+
+        def carried_high():
+            z_hist.append(float(lst.last["franka_object_pose"].position[2]))
+            return max(z_hist) > 0.12  # it did travel through the air
+
+        assert lst.wait_for(carried_high, 20), "the object was not carried"
+
+        def released_and_held():
+            gs = lst.last.get("franka_gripper_state")
+            return "released it" in env.log() and gs is not None and gs.is_grasped and "Press x to release" in ctrl.log()
+
+        assert lst.wait_for(released_and_held, 40), ctrl.log()[-3000:] + env.log()[-1000:]
+        lst.spin(2.0)
+        gs = lst.last.get("franka_gripper_state")
+        assert gs is not None and gs.is_grasped, "the object was dropped"

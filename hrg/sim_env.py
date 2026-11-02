@@ -18,12 +18,17 @@ plus:
 Keys (terminal or viewer): ``k`` push the hand with ``push_force`` N,
 horizontally in a random direction, for ``push_duration`` s (the paper's
 "physical pushes"); ``o`` move the object anywhere within ``jump_xy_half``
-(a "sudden change of the target"); ``r`` reset.
+(a "sudden change of the target"); ``m`` **carry** the object: it is welded
+to a kinematic carrier (a mocap body) that glides along a smooth random path
+through ``carry.box`` (mid-air included, ``hrg.carry``) at ``carry.speed``
+and then holds it there, like a hand holding it out, until both finger pads
+touch it, when the carrier lets go; ``r`` reset.
 
 Config::
 
     obstacles:
       - {half: [0.03, 0.06, 0.06], centre: [0.45, 0.2, 0.06], amp: [0.0, 0.08], freq: 0.15, phase: 0.0}
+    carry: {box: [[0.35, 0.65], [-0.3, 0.3], [0.05, 0.4]], waypoints: 4, speed: 0.3, yaw_range: 1.0, seed: 0}
 """
 
 from __future__ import annotations
@@ -38,7 +43,11 @@ from fr3.data_type.basic_types.NamedVecListData import NamedVecListData
 from fr3.data_type.basic_types.SE3PoseData import SE3PoseData
 from fr3.env.MujocoColEnv import MujocoColEnv
 from hrg import obstacles as obstacle_msg
+from hrg.carry import CarryPath, random_waypoints
 from hrg.objects import GraspObject
+
+CARRY_EQ = "carry"  # the weld between the carrier and the object
+PAD_BODIES = ("robotiq_left_pad", "robotiq_right_pad")
 
 
 class HRGSimEnv(MujocoColEnv):
@@ -67,7 +76,14 @@ class HRGSimEnv(MujocoColEnv):
         self._push_vec = np.zeros(3)
         self._obs_contact_steps = 0
         self._object_body_id = -1
+        self._carry_cfg = dict(config.get("carry", None) or {})
+        self._carry_rng = np.random.default_rng(int(self._carry_cfg.get("seed", seed)) + 200)
+        self._carry = None  # (CarryPath, t_start) while the object is carried / held out
+        self._carry_touch_steps = 0
         super().__init__(config, *args, **kwargs)
+        self._pad_bodies = {self.mj_model.body(n).id for n in PAD_BODIES}
+        self._carry_eq = self.mj_model.equality(CARRY_EQ).id
+        self._carrier = self.mj_model.body("carrier").mocapid[0]
         self._robot_bodies = {b for b in range(self.mj_model.nbody)
                               if self.mj_model.body(b).name.startswith(("fr3_", "robotiq_"))}
         print(f"[HRGSimEnv] object={self.obj.name} ({self.obj.mass} kg), {len(self._obs_cfg)} moving obstacles. "
@@ -86,10 +102,19 @@ class HRGSimEnv(MujocoColEnv):
             body = self.mj_spec.worldbody.add_body(name=f"obstacle_{i}", mocap=True, pos=list(o["centre"]))
             body.add_geom(name=f"obs_box_{i}", type=mj.mjtGeom.mjGEOM_BOX, size=list(o["half"]),
                           rgba=[0.9, 0.5, 0.2, 0.8])
+        # The carrier (key m): a kinematic body welded to the object while it is carried.
+        self.mj_spec.worldbody.add_body(name="carrier", mocap=True, pos=[0.5, 0.0, 0.5])
+        eq = self.mj_spec.add_equality()
+        eq.name, eq.type, eq.objtype = CARRY_EQ, mj.mjtEq.mjEQ_WELD, mj.mjtObj.mjOBJ_BODY
+        eq.name1, eq.name2, eq.active = "carrier", "grasp_object", False
+        eq.solref = [0.005, 1.0]  # stiff: the object follows the carrier to the mm
 
     def reset(self) -> None:
         super().reset()
         self._object_body_id = self.mj_model.body("grasp_object").id
+        self._carry = None
+        if self.mj_model is not None and hasattr(self, "_carry_eq"):
+            self.mj_data.eq_active[self._carry_eq] = 0
         self._place_object(self._spawn_xy_half)
 
     def _place_object(self, xy_half: np.ndarray) -> None:
@@ -142,6 +167,8 @@ class HRGSimEnv(MujocoColEnv):
             self._push()
         elif key in ("o", "O"):
             self._place_object(self._jump_xy_half)
+        elif key in ("m", "M"):
+            self._start_carry()
         else:
             super()._handle_key(key)
 
@@ -150,8 +177,70 @@ class HRGSimEnv(MujocoColEnv):
             self._push()
         elif keycode in (ord("o"), ord("O")):
             self._place_object(self._jump_xy_half)
+        elif keycode in (ord("m"), ord("M")):
+            self._start_carry()
         else:
             super()._key_callback(keycode)
+
+    # ------------------------------------------------------------------ carry
+    def _start_carry(self) -> None:
+        """Weld the object to the carrier where it is and send the carrier
+        along a smooth random path (``hrg.carry``); at the end it holds the
+        object out until the gripper's pads take it."""
+        c = self._carry_cfg
+        b = self._object_body_id
+        R0 = self.mj_data.xmat[b].reshape(3, 3).copy()
+        p0 = self.mj_data.xpos[b].copy()
+        P, Y = random_waypoints(self._carry_rng, p0, c.get("box", [[0.35, 0.65], [-0.3, 0.3], [0.05, 0.4]]),
+                                int(c.get("waypoints", 4)), 0.0, float(c.get("yaw_range", 1.0)))
+        path = CarryPath(P, Y, R0, float(c.get("speed", 0.3)), float(c.get("min_duration", 2.0)))
+        self.mj_data.mocap_pos[self._carrier] = p0
+        self.mj_data.mocap_quat[self._carrier] = self.mj_data.xquat[b]
+        self.mj_model.eq_data[self._carry_eq, :10] = [0, 0, 0, 0, 0, 0, 1, 0, 0, 0]  # anchor 0, relpose = identity
+        self.mj_data.eq_active[self._carry_eq] = 1
+        jid = self.mj_model.body_jntadr[b]
+        dadr = int(self.mj_model.jnt_dofadr[jid])
+        self.mj_data.qvel[dadr:dadr + 6] = 0.0
+        self._carry = (path, float(self.mj_data.time))
+        self._carry_touch_steps = 0
+        print(f"[HRGSimEnv] Carry: {len(P) - 1} waypoints, {path.length:.2f} m in {path.duration:.1f} s, "
+              f"to ({P[-1][0]:.2f}, {P[-1][1]:.2f}, {P[-1][2]:.2f}); released when both pads touch the object.")
+
+    def _carry_step(self) -> None:
+        path, t0 = self._carry
+        t = float(self.mj_data.time) - t0
+        p, quat = path.pose(t)
+        self.mj_data.mocap_pos[self._carrier] = p
+        self.mj_data.mocap_quat[self._carrier] = quat
+        # Let go as soon as both pads hold the object, moving or not: a kinematic carrier that
+        # keeps pulling a grasped object drags the whole arm along with it.
+        self._carry_touch_steps = self._carry_touch_steps + 1 if self._pads_touch_object() else 0
+        if self._carry_touch_steps * self.mj_model.opt.timestep >= 0.02:
+            self.mj_data.eq_active[self._carry_eq] = 0
+            self._carry = None
+            print(f"[HRGSimEnv] Carry: both pads on the object, released it ({t:.1f} s after the start"
+                  f"{'' if path.done(t) else ', still moving'}).")
+
+    def _pads_touch_object(self) -> bool:
+        """Both finger pads in contact with the object. Any other robot body
+        touching the carried object is reported (the hand ran into it)."""
+        m, d = self.mj_model, self.mj_data
+        touching = set()
+        for c in d.contact[: d.ncon]:
+            bodies = (m.geom_bodyid[c.geom1], m.geom_bodyid[c.geom2])
+            if self._object_body_id in bodies:
+                touching.update(b for b in bodies if b in self._pad_bodies)
+                other = [b for b in bodies if b in self._robot_bodies and b not in self._pad_bodies]
+                if other:
+                    self._carry_hits = getattr(self, "_carry_hits", 0) + 1
+                    if self._carry_hits % 100 == 1:
+                        print(f"[HRGSimEnv] Carry: {m.body(other[0]).name} hit the carried object "
+                              f"(t = {d.time:.2f} s, {self._carry_hits} contact steps so far)")
+        return len(touching) == len(self._pad_bodies)
+
+    @property
+    def carrying(self) -> bool:
+        return self._carry is not None
 
     def _push(self) -> None:
         th = self._push_rng.uniform(0.0, 2.0 * np.pi)
@@ -164,6 +253,8 @@ class HRGSimEnv(MujocoColEnv):
         t = float(self.mj_data.time)
         for i in range(len(self._obs_cfg)):
             self.mj_data.mocap_pos[self.mj_model.body(f"obstacle_{i}").mocapid[0]] = self._obstacle_pose(i, t)
+        if self._carry is not None:
+            self._carry_step()
         self.mj_data.xfrc_applied[self.mj_model.body("fr3_gripper").id, :3] = (
             self._push_vec if t < self._push_until else 0.0)
         super()._step_simulation()

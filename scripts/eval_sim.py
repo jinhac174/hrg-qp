@@ -110,7 +110,7 @@ def tilt_deg(quat_wxyz) -> float:
 
 
 def run_trial(out: Path, obj: str, pose: str, seed: int, field: str, timeout: float, env_cfgs=(ENV_CFG,),
-              push_at=(), jump_at=(), orientation: str = "upright", ctrl_extra=()) -> dict:
+              push_at=(), jump_at=(), orientation: str = "upright", ctrl_extra=(), carry_at=()) -> dict:
     row = dict(object=obj, orientation=orientation, pose=pose, seed=seed, field=field, success=False,
                t_grasp=np.nan, t_lift=np.nan, ft_err=np.nan, infra=False, tilt_start=np.nan, tilt_end=np.nan,
                held_end=False)
@@ -131,7 +131,7 @@ def run_trial(out: Path, obj: str, pose: str, seed: int, field: str, timeout: fl
         lst.reset_counts()
         t0 = t_prev = time.time()
         err_hist, trace, state = [], [], []
-        events = sorted([(t, "k") for t in push_at] + [(t, "o") for t in jump_at])
+        events = sorted([(t, "k") for t in push_at] + [(t, "o") for t in jump_at] + [(t, "m") for t in carry_at])
         while time.time() - t0 < timeout:
             lst.spin(0.05)
             if time.time() - t_prev > 2.0:  # the machine slept / froze
@@ -156,6 +156,8 @@ def run_trial(out: Path, obj: str, pose: str, seed: int, field: str, timeout: fl
             if float(lst.last["franka_object_pose"].position[2]) - z0 > 0.05 and held and not events:
                 row["success"], row["t_lift"] = True, time.time() - t0
                 break
+        if "Traceback" in ctrl.log():  # a crashed plan thread leaves the arm in the stale hold
+            row["success"], row["note"] = False, "controller exception (see ctrl.log)"
         if row["success"]:  # until the controller holds it (after the upright phase), then the tilt
             t1 = time.time()
             while time.time() - t1 < 15.0 and "Press x to release" not in ctrl.log():
@@ -196,6 +198,7 @@ def main():
                     help="controller config overrides, e.g. --ctrl hrg.horizon=0.15 grasp.lift_height=0.2")
     ap.add_argument("--push_at", type=float, nargs="*", default=[])
     ap.add_argument("--jump_at", type=float, nargs="*", default=[])
+    ap.add_argument("--carry_at", type=float, nargs="*", default=[], help="s after v: carry the object (env key m)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -211,7 +214,8 @@ def main():
                     for _ in range(3):
                         wait_for_lcm()
                         r = run_trial(out / f"{field}_{obj}_{ori}_{pose}_{seed}", obj, pose, seed, field,
-                                      args.timeout, env_cfgs, args.push_at, args.jump_at, ori, ctrl_extra)
+                                      args.timeout, env_cfgs, args.push_at, args.jump_at, ori, ctrl_extra,
+                                      args.carry_at)
                         if not r["infra"]:
                             break
                         print(f"  infra problem ({r.get('note')}), retrying", flush=True)

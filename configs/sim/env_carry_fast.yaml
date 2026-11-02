@@ -1,0 +1,11 @@
+# A faster, longer carry (env key m, hrg/carry.py): the object glides through the air at up to
+# 0.5 m/s for 10 s, faster than the fingertip field's 0.5 m/s cruise, so the hand chases it
+# through the workspace and takes it as it slows:
+#   python scripts/record_video.py --env configs/sim/env_carry_fast.yaml --object gold_bowl --carry_at -3
+carry:
+  box: [[0.35, 0.58], [-0.30, 0.30], [0.08, 0.33]]
+  waypoints: 8
+  speed: 0.5               # m/s
+  yaw_range: 1.2           # rad, each way
+  min_duration: 10.0       # s
+  seed: 1

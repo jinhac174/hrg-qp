@@ -14,6 +14,8 @@ trial keeps the CPU to the real-time simulation and the frame timing exact.
     python scripts/record_video.py --object blue_bowl --pose center_up --push_at 1.5 4.0 --jump_at 3.0
     # Fig. 8: moving obstacles
     python scripts/record_video.py --env configs/sim/env_obstacles.yaml --object wine_glass --pose center_up
+    # the object carried along a smooth path through the air (env key m), grasped where it is held out
+    python scripts/record_video.py --object gold_bowl --pose center_up --carry_at 0.5 --duration 30
     # the robot (or a sim you started yourself): record the bus for 20 s
     python scripts/record_video.py --live --object blue_bowl --duration 20
 
@@ -181,7 +183,7 @@ class Sampler:
 
 
 def record_trial(path: str, obj: str, pose: str, seed: int, field: str, orientation: str, env_cfgs,
-                 push_at, jump_at, duration: float, width: int, height: int, title: str) -> dict:
+                 push_at, jump_at, duration: float, width: int, height: int, title: str, carry_at=()) -> dict:
     env_cfg = OmegaConf.merge(*[OmegaConf.load(resolve(f)) for f in env_cfgs])
     halves = [o["half"] for o in (env_cfg.get("obstacles") or [])]
     sub = (f"{obj}, gripper start {pose.replace('_', '-')}, {orientation}, placement {seed}"
@@ -201,7 +203,11 @@ def record_trial(path: str, obj: str, pose: str, seed: int, field: str, orientat
                            "--object_config", f"configs/objects/{obj}.yaml", "--hrg.field", field)
         if not lst.wait_for(lambda: lst.count["franka_arm_joint_ctrl"] > 500, 90):
             raise RuntimeError(f"controller did not start:\n{ctrl.log()[-2000:]}")
-        pending = sorted([(t, "k") for t in push_at] + [(t, "o") for t in jump_at])
+        pending = sorted([(t, "k") for t in push_at] + [(t, "o") for t in jump_at] + [(t, "m") for t in carry_at])
+        labels = {"k": "PUSH on the hand", "o": "OBJECT MOVED", "m": "OBJECT CARRIED AWAY"}
+        # v comes 1 s after the start; an event at a negative time (an object already on the
+        # move when the reach begins) pushes v back so the event still precedes it by that much
+        t_v_at = 1.0 + max(0.0, -min([t for t, _ in pending], default=0.0))
         shown: list[tuple[float, str]] = []
         t_start, t_v, t_end = time.time(), None, None
         n, log = 0, ""
@@ -209,14 +215,14 @@ def record_trial(path: str, obj: str, pose: str, seed: int, field: str, orientat
             t_frame = t_start + n / FPS
             lst.spin(max(0.0, t_frame - time.time()))
             now = time.time()
-            if t_v is None and now - t_start >= 1.0:
+            if t_v is None and now - t_start >= t_v_at:
                 ctrl.key("v")
                 t_v = now
-            t = 0.0 if t_v is None else now - t_v
-            while t_v is not None and pending and t >= pending[0][0]:
+            t = now - t_start - t_v_at  # s after v (negative before it)
+            while pending and t >= pending[0][0]:
                 tk, key = pending.pop(0)
                 env.key(key)
-                shown.append((tk, "PUSH on the hand" if key == "k" else "OBJECT MOVED"))
+                shown.append((tk, labels[key]))
             log = ctrl.log() if n % 3 == 0 else log
             state = _state(log)
             gs = lst.last.get("franka_gripper_state")
@@ -226,7 +232,7 @@ def record_trial(path: str, obj: str, pose: str, seed: int, field: str, orientat
                 info["lifted"], info["t_lift"] = True, t
             if t_end is None and (state == "hold" or (t_v is not None and t >= duration)):
                 t_end = now + 2.0
-            events = [e for te, e in shown if 0.0 <= t - te < 1.2]
+            events = [e for te, e in shown if 0.0 <= t - te < (4.0 if e.startswith("OBJECT CARRIED") else 1.2)]
             sampler.take(now - t_start, lst, t, state, events)
             n += 1
             if t_end is not None and now >= t_end:
@@ -267,6 +273,8 @@ def main():
     ap.add_argument("--env", nargs="*", default=[], help="extra env configs on top of configs/sim/env.yaml")
     ap.add_argument("--push_at", type=float, nargs="*", default=[])
     ap.add_argument("--jump_at", type=float, nargs="*", default=[])
+    ap.add_argument("--carry_at", type=float, nargs="*", default=[],
+                    help="s after v (negative: before it): carry the object (env key m)")
     ap.add_argument("--duration", type=float, default=20.0, help="s after v at most (the paper's 20 s)")
     ap.add_argument("--title", default=None)
     ap.add_argument("--live", action="store_true", help="record the bus (robot / your own sim) for --duration s")
@@ -285,14 +293,14 @@ def main():
     if len(args.fields) == 1:
         f = args.fields[0]
         info = record_trial(name, args.object, args.pose, args.seed, f, args.orientation, env_cfgs, args.push_at,
-                            args.jump_at, args.duration, 1280, 720, args.title or FIELD_LABEL[f])
+                            args.jump_at, args.duration, 1280, 720, args.title or FIELD_LABEL[f], args.carry_at)
         print(f"{name}: {f} {'lifted at %.1f s' % info['t_lift'] if info['lifted'] else 'not lifted'}")
         return
     parts = []
     for f in args.fields:  # one after the other (never two real-time sims at once)
         part = name.replace(".mp4", f"_{f}.mp4")
         info = record_trial(part, args.object, args.pose, args.seed, f, args.orientation, env_cfgs, args.push_at,
-                            args.jump_at, args.duration, 960, 540, FIELD_LABEL[f])
+                            args.jump_at, args.duration, 960, 540, FIELD_LABEL[f], args.carry_at)
         print(f"{part}: {f} {'lifted at %.1f s' % info['t_lift'] if info['lifted'] else 'not lifted'}")
         parts.append(part)
     # side by side; the shorter clip holds its last frame

@@ -29,6 +29,82 @@ the object is held (`is_grasped`) 5 cm above its rest height within the time
 limit; trials where the bus or a process died are marked `infra` and
 repeated, never counted.
 
+## Fast defaults: acceleration-bounded planning and inertia feed-forward (2026-11-02)
+
+The sections after this one were measured with the earlier defaults
+(`hrg.v_const` 0.15 m/s, the Kd-only low level). The defaults are now the
+fast ones of docs/method.md "Speed": 0.5 m/s fingertip fields with the FR3's
+acceleration limits in the QP, the plan's acceleration fed forward through
+`M(q)`, the gripper streamed at the commanded rate and pre-shaped to the
+chosen grasp, a 0.8 m/s lift, the object pose extrapolated between
+perception frames and its velocity in the fields and rows. Everything below
+was run on the MacBook with the simulation alone on the machine:
+
+```bash
+python scripts/eval_sim.py --objects box blue_bowl gold_bowl blue_mug wine_glass --orientations all --seeds 2 --timeout 30
+python scripts/eval_sim.py --objects blue_bowl blue_mug --seeds 1 --push_at 0.4 0.9 --jump_at 0.6 --timeout 30      # Fig. 7
+python scripts/eval_sim.py --env configs/sim/env_obstacles.yaml --objects wine_glass --seeds 2 --timeout 30          # Fig. 8
+python scripts/eval_sim.py --env configs/sim/env_carry.yaml --objects gold_bowl blue_mug box --poses center_up --seeds 2 --carry_at 0 --timeout 40
+```
+
+**Table I set** (5 objects × orientations × 3 start poses × 2 placements): **77 / 78** grasped,
+lifted, turned upright and still held at the end, with no failed first close and no object
+lost. The miss is the mug lying on its side (−90° about x) from the center-up start, placement
+2: the reach stalls 5 cm short with two finger spheres on the object's 1 cm margin, the
+local minimum of the paper's Fig. 12 (fingertip targets planned without the joint
+configuration; `scripts/dissect.py` reproduces it kinematically; a stronger posture pull
+gets through it and breaks other placements, so it is left as it is).
+
+| | before (2026-10-28) | fast defaults |
+|---|---|---|
+| time from `v` to the object 5 cm up, median (max) | 5.4 s (8.5 s) | **1.9 s (5.4 s)** |
+| box / bowls / mug / wine glass, median lift | — | 1.6 / 1.5 / 1.9 / 2.1 s |
+| object tilt after the upright turn, median (max) | 2.8° (5.4°) | 2.9° (5.9°) |
+| fingertip error at the trigger, median (max) | — | 0.87 cm (1.02 cm) |
+| plan time, median (max) | — | 8.7 ms (15.4 ms, the box) |
+
+The 5.4 s maximum is a lying wine glass reached from the side (grasped at 5.0 s, no
+retries). The plan time grew from ~3 ms because eq. (3) is now solved on every plan, also on
+the straight final approach (a straight line taken on trust from off the axis crossed the
+object); it stays under the 10 ms period except on the box and on the lying mug, whose plans
+then run at ~70 Hz.
+
+**Low level** (`scripts/diagnose_tracking.py`, gold bowl from left-bottom): command → joint
+velocity lag 2–10 ms on every joint (25–31 ms on joints 2 and 4 with the Kd loop alone); peak
+joint accelerations at the limits (10 / 15 / 20 rad/s²); the gripper stream has the fingers
+stopped 4 % of the time (33 % before); grasped 1.0 s after `v`, lifted at 1.5 s, upright at
+1.7 s (4.0 s, 5.3 s and — before this work).
+
+**Fig. 7** (pushes at 0.4 and 0.9 s, the object moved at 0.6 s, all during the reach): 6 / 6,
+lifted in 2.9–3.0 s, tilt at the end 1–3°. (With the perturbation times of the slow robot,
+1.0 / 2.0 / 1.5 s, the bowl is already lifted at 1.2 s and the "moved object" teleports it
+out of the closed hand: not a reach failure, a test that no longer fits the speed.)
+**Fig. 8** (four moving obstacles, wine glass): 6 / 6, no robot–obstacle contact, lifted in
+1.7–2.0 s.
+
+**Carried objects** (env key `m`: the object welded to a kinematic carrier that glides along a
+C² spline through random waypoints up to 33 cm above the table, then holds it out; the carrier
+lets go as soon as both pads hold the object; `hrg/carry.py`): gold bowl, mug and box, 2 paths
+each at 0.35 m/s, **6 / 6** grasped in the air while still moving (1.5–1.8 s after `v`), lifted
+and upright within 3°. Chasing a mug carried at up to 0.5 m/s (`configs/sim/env_carry_fast.yaml`,
+video 28): the hand follows it for 6 s with 1–5 cm of fingertip error, joint velocity errors of
+0.04–0.07 rad/s RMS and accelerations within the limits, and takes it at 6.2 s.
+
+**What these runs found and fixed** (all measured, none patched around):
+- in the new acceleration box, a joint already past its velocity bound was sent to the far edge
+  of the box (accelerating into its limit; the arm folded into itself on a lying mug);
+- the hard distance rows went infeasible when a row inside its margin demanded more separation
+  than one period of acceleration allows (the lift stood still): hence the slack fallback;
+- the shaking seen on carried objects: an on/off approach corridor that flipped the plan several
+  times a second, a goal behind the hand, the 1.5 mm first path segment as the direction, the
+  30 Hz pose hold, the object's velocity unknown to the fields and rows, the arm holding still
+  during the close while the object moved into the palm, and the demo's carrier dragging a
+  grasped object until its path ended (docs/method.md "Speed");
+- the gripper's slowness: the simulated gripper restarted its ramp at the lagging measured
+  width on every streamed set-point (17 mm/s creep whatever speed was asked; a second of hovering
+  before every grasp); the real 2F-85 re-targets a running motion, and so does the sim now;
+- `v_const` 0.8 → 0.5 m/s: the eq. (5) decay's own deceleration must fit the arm's.
+
 ## The oriented reach and the paper's low level (2026-10-28)
 
 The sections after this one were measured before 2026-10-28, with what were
@@ -224,3 +300,9 @@ chosen among the Table I placements where the baseline failed.
 19. `19_disturbance_knocks_the_mug_over.mp4`: the Fig. 7 trial whose second push knocks the mug over; the controller re-targets the lying mug and, in this recording, stalls 1 cm short at joint 5's limit (it lifted in two of three validation runs).
 20. `20_moving_obstacles_wine_glass.mp4`, 21. `21_moving_obstacles_bowl.mp4`, 22. `22_moving_obstacles_wine_glass_from_the_side.mp4`: Fig. 8 from two starts, no contact with the boxes.
 23. `23_marginal_lying_mug_near_the_base.mp4`: the Table I failure case (lying mug, left-bottom, seed 2): the elbow at its limit, the fingertips about 1 cm from the trigger, the hand resting still on its margin.
+
+24. `24_carried_gold_bowl.mp4`: the bowl carried along a smooth path through the air (env key `m`, `configs/sim/env_carry.yaml`, moving 2 s before the reach starts), taken in the air while moving, lifted and upright.
+25. `25_carried_blue_mug.mp4`: the same with the mug on another path.
+26. `26_fast_gold_bowl.mp4`: the fast defaults on the gold bowl from the left-bottom start (grasped at 1.0 s, lifted at 1.2 s).
+27. `27_fast_lying_mug.mp4`: the fast defaults on a lying mug: grasped, lifted and turned upright within 3 s.
+28. `28_chase_blue_mug.mp4`: the mug carried at up to 0.5 m/s for 10 s (`configs/sim/env_carry_fast.yaml`), chased through the air for 6 s and taken as it slows.

@@ -14,8 +14,13 @@ object_config: configs/objects/blue_bowl.yaml
 hrg:
   field: path              # path: eqs. (3)-(5); linear: the eq. (2) baseline
   # eq. (5): fingertip speed
-  v_const: 0.15            # m/s far from the target
-  delta_x: 0.05            # m, quadratic slow-down radius
+  # Speed (docs/method.md): v_const <= a H, the braking the collision rows can demand within
+  # the horizon (hand acceleration ~5-8 m/s^2 at the joint limits below, H = 0.10 s), and the
+  # eq. (5) slow-down's own peak deceleration ~1.5 v_const^2 / delta_x within that acceleration
+  # (0.5 m/s, 10 cm: 3.8 m/s^2). 0.8 m/s with 8 cm needs 12 m/s^2: the plans then ride the
+  # acceleration bounds and the arm shakes.
+  v_const: 0.5             # m/s far from the target
+  delta_x: 0.10            # m, quadratic slow-down radius
   # eq. (2) baseline: K = linear_gain * I
   linear_gain: 1.0         # 1/s
   # eq. (3): fingertip paths (paper Sec. II-D)
@@ -35,7 +40,7 @@ hrg:
   T_g: 0.05
   # eqs. (9)-(10): gripper posture
   w_nominal: 0.085         # m, open
-  v_gr: 0.10               # m/s
+  v_gr: 0.15               # m/s, the 2F-85's fastest
   delta_gr: 0.02           # m
   eta_h: 0.06              # m: below this fingertip error the posture field fades out
   T_h: 0.02
@@ -54,18 +59,26 @@ hrg:
   # orientation and that configuration; the last approach_dist come straight in.
   orient: true             # false: the paper's reach (fingertip points only)
   rot_weight: 0.1          # alpha full weight: alpha(theta) |J_r,b qdot - w_des,b|^2 per vector pair
-  rot_gain: 2.0            # 1/s, w_des,b = R^T sat(rot_gain (R n_b) x n_t, rot_max)
-  rot_max: 1.0             # rad/s
-  rot_threshold: 30.0      # deg, alpha full above, linear to 0 below (2 sin 30 deg = the cap)
+  rot_gain: 3.0            # 1/s, w_des,b = R^T sat(rot_gain (R n_b) x n_t, rot_max)
+  rot_max: 1.5             # rad/s
+  rot_threshold: 30.0      # deg, alpha full above, linear to 0 below (3 sin 30 deg = the cap)
   approach_dist: 0.10      # m, straight final approach along the target's approach axis
   posture_weight: 0.05     # |qdot - posture_gain (q_grasp - q)|^2: the chosen grasp configuration
-  posture_gain: 1.0        # 1/s
+  posture_gain: 3.0        # 1/s
   select_w_pref: 2.0       # rad of joint motion per rad off the object's preferred approach
   select_shortlist: 6      # new grasp candidates solved by IK per plan
+  # Once a grasp is chosen the posture field (eq. 9) opens the gripper to the targets' opening
+  # + this on each side instead of fully, so the fingers straddle the object as they come in
+  # and the width never limits the straight approach (0: the paper's w_nominal throughout).
+  preshape_margin: 0.01    # m
 
 # Gamma(q) of eq. (11): robot vs environment (the scene's floor / wall_* geoms,
 # published by the env / run_hardware.py) and vs itself.
-joint_velocity_limit: [2, 2, 2, 2, 2.5, 2.5, 2.5]
+joint_velocity_limit: [2, 2, 2, 2, 2.5, 2.5, 2.5]           # rad/s (hardware.yaml brakes above its max_joint_vel)
+# The QP changes its velocity by at most these per plan period (|z - z_prev| <= a dt): the plan is
+# a profile the arm can follow, and the low level feeds the acceleration forward (hrg/lowlevel.py).
+joint_acceleration_limit: [10, 10, 10, 10, 15, 20, 20]    # rad/s^2, the FR3's limits
+width_acceleration_limit: 2.0                              # m/s^2, the 2F-85's set-point response
 env_col_margin: 0.02
 self_col_margin: 0.02
 # The hand's own boxes are not checked against the floor: the hand spheres vs
@@ -131,15 +144,15 @@ grasp:
   grasp_trigger_dist: 0.01 # m, both fingertips this close: close (paper: 1 cm sim, 1.5 cm robot)
   grasp_trigger_rot: 10.0  # deg, and the hand this close to its target orientation (hrg.orient)
   grasp_force: 30.0        # N
-  grasp_speed: 0.1         # m/s
+  grasp_speed: 0.15        # m/s, the 2F-85's fastest
   gripper_timeout: 3.0     # s
   lift_height: 0.15        # m
   lift_tol: 0.01           # m
-  lift_timeout: 5.0        # s
-  lift_speed: 0.15         # m/s
-  lift_angular_speed: 0.8  # rad/s
-  lift_pos_gain: 3.0       # 1/s
-  lift_rot_gain: 2.0       # 1/s
+  lift_timeout: 3.0        # s (a 15 cm lift takes ~0.4 s; near the reach limit it may not finish)
+  lift_speed: 0.8          # m/s
+  lift_angular_speed: 2.0  # rad/s
+  lift_pos_gain: 8.0       # 1/s
+  lift_rot_gain: 5.0       # 1/s
   lift_rot_weight: 0.5
   # After the lift: the held object back to its upright pose (object +z up; the
   # smallest tilt, about the TCP, raised until it clears the table).
@@ -150,22 +163,25 @@ grasp:
   held_eps: 0.02           # m, the held object's points above the table (lift, upright)
   held_points: 64
   payload_comp: true       # while holding: the object's weight (its config mass) added to g(q)
-home_gain: 1.0             # 1/s
+home_gain: 2.0             # 1/s
 # Holding states (idle, close, reopen, hold): the joints where the state began,
 # hold_gain (q_hold - q), at most hold_vmax rad/s, through the planner.
-hold_gain: 5.0             # 1/s
-hold_vmax: 0.3             # rad/s
+hold_gain: 10.0            # 1/s
+hold_vmax: 1.0             # rad/s
 
-# ---------------------------------------------------------------- low level (hrg/controller.py)
-# tau = kp (q_des - q) + kd (qdot_des - qdot) + g(q) + C(q, qdot) qdot + tau_f(qdot_des)
-# ref_mode step (paper Sec. II-D): q_des = q + qdot_des dt, so kp (q_des - q) is
+# ---------------------------------------------------------------- low level (hrg/controller.py, hrg/lowlevel.py)
+# qd_cmd: the plan's velocity ramped from the previous plan's over the plan period
+# tau = kp (q_des - q) + kd (qd_cmd - qdot) + M(q) qdd_cmd + g(q) + C(q, qdot) qdot + tau_f(qd_cmd)
+# ref_mode step (paper Sec. II-D): q_des = q + qd_cmd dt, so kp (q_des - q) is
 # ~1 % of the kd term: kp = 0, a damping (velocity) controller; the planner feeds
-# position back. ref_mode integral: q_des += qdot_des dt within max_ref_err (the
-# earlier variant; with kp [600, 600, 600, 600, 250, 150, 50] an integral term).
+# position back. inertia_ff: M(q) qdd_cmd, the command's acceleration fed forward,
+# so the arm follows the plan's velocity profile instead of lagging it by M/kd
+# (30-60 ms on joints 1-4). ref_mode integral: q_des += qd_cmd dt within max_ref_err
+# (the earlier variant; with kp [600, 600, 600, 600, 250, 150, 50] an integral term).
 ref_mode: step
 kp: [0, 0, 0, 0, 0, 0, 0]
 kd: [50, 50, 50, 20, 20, 20, 10]
-qd_filter: 0.25            # first-order filter on qdot_des per control tick
+inertia_ff: true
 max_ref_err: 0.05          # rad, |q_des - q| bound (ref_mode integral)
 max_plan_age: 0.2          # s, no new plan for this long: hold the joints (stale_hold_*)
 stale_hold_kp: [300, 300, 300, 300, 125, 75, 25]
@@ -179,8 +195,14 @@ friction:
   viscous: [0.21, 0.21, 0.21, 0.21, 0.21, 0.21, 0.21]          # Nm s/rad
   v_smooth: 0.02           # rad/s
   max: [1.0, 1.0, 1.0, 1.0, 0.5, 0.5, 0.3]                    # Nm
-width_stream_freq: 50.0    # Hz, move set-points to the gripper while reaching
-width_max_lead: 0.01       # m, w_ref stays this close to the measured width
+# The object pose carried forward at its estimated velocity between perception frames (30 Hz
+# sim, ~24 Hz FoundationPose): a moving object's targets then move smoothly at the plan rate
+# instead of stepping every 3-4 plans (each step hit the acceleration bounds: a shaking arm).
+object_pose_predict: true
+# Gripper width rate -> set-points a little ahead of the integrated width, each at the speed
+# |wdot| (lowlevel.WidthStream): the fingers move continuously at the commanded rate.
+width_stream_freq: 50.0    # Hz
+width_max_lead: 0.01       # m, w_ref stays this close to the measured width (no wind-up)
 
 sub_manager:
   arm_joint_meas_channel: franka_arm_joint_meas

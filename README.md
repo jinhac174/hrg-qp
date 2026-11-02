@@ -9,10 +9,14 @@ At 100 Hz, at the measured state: select fingertip targets on the object
 (eq. 12), plan collision-free fingertip paths and take their initial
 directions as velocity fields (eqs. 3-5), add the gripper-posture and
 grasp-stability fields (eqs. 6-10), and track all of them with one joint-space
-QP under the full robot's collision and limit constraints (eq. 11). At 1 kHz:
-the paper's low level, PD on the QP velocity integrated over one control
-interval (a damping controller: Kp is 0), with gravity (wrist camera and held
-object included) and friction feed-forward.
+QP under the full robot's collision and limit constraints (eq. 11), plus the
+FR3's acceleration limits. At 1 kHz: the paper's low level, PD on the QP
+velocity integrated over one control interval (a damping controller: Kp is
+0), with the plan's acceleration, gravity (wrist camera and held object
+included) and friction fed forward. Fast by default (0.5 m/s fingertips, the
+FR3's acceleration limits, a 0.4 s lift; docs/method.md "Speed"), the
+gripper moves continuously at the commanded rate, and a moving object is
+followed with its pose extrapolated between perception frames.
 
 Beyond the paper (`hrg.orient`, on by default): the **oriented reach**. Every
 target pair has a hand orientation in the object's frame; the QP also tracks
@@ -39,6 +43,8 @@ hrg/                   the method and its runtime
   robot.py             FR3 kinematics / dynamics (Pinocchio), Gamma(q) (FCL)
   planner.py           one planning step, eqs. (2)-(12), a function of the state
   controller.py        the LCM controller: plan thread, grasp / lift, the 1 kHz control law
+  lowlevel.py          the plan's velocity ramped between plans, inertia feed-forward, the gripper's width stream
+  carry.py             a smooth pose path for an object carried through the workspace (env key m)
   sim_env.py           the MuJoCo study env (object, pushes, moved object, moving obstacles)
   objects.py, obstacles.py, study.py, viz.py, render.py, processes.py, cli.py, paths.py
 fr3/                   the FR3 stack this runs on (from franka_visual_servoing, pruned):
@@ -51,7 +57,8 @@ run_sensors.py, run_perception.py, run_pose_bridge.py   cameras -> FoundationPos
 run_grav_comp.py, run_camera_calibration.py             move the arm by hand; base -> camera extrinsic
 configs/               controller.yaml (the method's parameters), sim/, robot/, objects/, visualizer.yaml
 assets/robot/          FR3 + 2F-85 MJCF / URDF / meshes;  assets/objects/<name>/: scans, meshes, targets
-scripts/               prepare_objects.py, eval_sim.py, rollout.py, dissect.py, plot_trace.py, record_video.py, sim.sh
+scripts/               prepare_objects.py, eval_sim.py, rollout.py, dissect.py, diagnose_tracking.py, plot_trace.py,
+                       record_video.py, sim.sh
 scripts/robot/         preflight.py, identify_payload.py, robotiq_tcp_bridge.py, publish_obstacles.py
 tests/                 unit (method, models, safety layer) and integration (sim, robot pipeline)
 ```
@@ -77,7 +84,9 @@ python run_visualizer.py --config configs/visualizer.yaml --object_mesh assets/o
 ```
 
 Controller terminal: `v` reach and grasp, `x` open and stop, `h` home.
-Env terminal or viewer: `k` push the hand, `o` move the object.
+Env terminal or viewer: `k` push the hand, `o` move the object, `m` carry
+the object along a smooth path through the air and hold it out until the
+pads take it (`configs/sim/env_carry.yaml` for a longer path).
 `--hrg.field linear` runs the eq. (2) baseline; `--config configs/sim/env.yaml
 configs/sim/env_obstacles.yaml` adds moving obstacles. Objects:
 `box`, `blue_bowl`, `blue_mug`, `wine_glass`, `white_plate`, `red_cup`, `tape`.
@@ -89,6 +98,8 @@ python scripts/eval_sim.py --fields path linear --orientations all           # T
 python scripts/rollout.py --fields path linear --placements 20               # the planner alone, kinematic
 python scripts/dissect.py outputs/eval/table1/<trial>/trace.npz --t_start 5  # replay a recorded trial: what binds?
 python scripts/record_video.py --object blue_mug --pose left_bottom --fields path linear
+python scripts/record_video.py --env configs/sim/env_carry.yaml --object gold_bowl --carry_at 0.5   # a carried object
+python scripts/diagnose_tracking.py --object gold_bowl                    # command -> motion lag, gripper smoothness
 python scripts/prepare_objects.py                                            # regenerate objects / targets
 pytest -m "not integration"     # ~35 s
 pytest -m integration           # ~1 min, starts the sim / controller / fake-hardware processes
