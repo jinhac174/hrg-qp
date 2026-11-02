@@ -12,6 +12,7 @@ from fr3.data_type.basic_types.GripperCmdData import GripperCmdData
 from fr3.data_type.basic_types.GripperStateData import GripperStateData
 from fr3.data_type.basic_types.JointCtrlData import JointCtrlData
 from fr3.data_type.basic_types.JointMeasData import JointMeasData
+from fr3.robot_platform import fr3_limits
 from fr3.robot_platform.gripper import robotiq_2f85 as rq
 from fr3.robot_platform.sim.BaseSimPlatform import BaseSimPlatform
 
@@ -229,6 +230,13 @@ class SimFrankaFR3(BaseSimPlatform):
 
         tau = kp * (q_des - q) + kd * (qd_des - qd) + tau_ff
 
+    changing by at most the FR3's ``TAU_RATE_MAX`` per second (libfranka's
+    rate limiter) and saturating at its torque limits (the actuators).
+    ``torque_delay`` / ``torque_lag`` (s, one or per joint; default 0): the
+    robot's own torque response, a dead time and a first-order lag between
+    the commanded and the link-side torque (on the FR3 1-7 ms and 12-38 ms on
+    joints 1-4, from the flight recorder of 2026-11-02).
+
     ``gravity_comp: true`` (default) mimics the FR3 firmware, which always
     compensates gravity itself in torque control: the commanded torque is
     *on top of* gravity, so controllers must NOT add g(q). Implemented with
@@ -255,6 +263,8 @@ class SimFrankaFR3(BaseSimPlatform):
         default_q_values=None,
         default_gripper_width: float = GRIPPER_MAX_WIDTH,
         gravity_comp: bool = True,
+        torque_delay=0.0,
+        torque_lag=0.0,
         arm_joint_meas_freq: int = 1000,
         gripper_meas_freq: int = 100,
         arm_joint_meas_channel: str = "franka_arm_joint_meas",
@@ -275,12 +285,17 @@ class SimFrankaFR3(BaseSimPlatform):
         self._default_q = np.array(default_q_values, dtype=np.float64)
         self._default_width = float(default_gripper_width)
         self._gravity_comp = bool(gravity_comp)
+        self._torque_delay = np.broadcast_to(np.asarray(torque_delay, dtype=float), (NUM_ARM_JOINTS,)).copy()
+        self._torque_lag = np.broadcast_to(np.asarray(torque_lag, dtype=float), (NUM_ARM_JOINTS,)).copy()
+        self._tau_sent = []  # the commanded torques of the last torque_delay (newest last)
+        self._tau_act = None  # the torque the joints apply (after delay and lag)
 
         self.arm_joint_meas_data = JointMeasData(num_joints=NUM_ARM_JOINTS)
         self.gripper_joint_meas_data = JointMeasData(num_joints=NUM_GRIPPER_JOINTS)
         self.gripper_state_data = GripperStateData()
         self._last_ctrl_data = JointCtrlData(num_joints=NUM_ARM_JOINTS)
         self._ever_received_ctrl = False
+        self._tau_prev = None  # the torque applied last step (torque-rate limit)
 
         self._gripper = _GripperSim(self._default_width)
         self._gripper_cmd_channel = gripper_cmd_channel
@@ -359,9 +374,27 @@ class SimFrankaFR3(BaseSimPlatform):
             # the arm would collapse before the controller connects. Once a
             # controller is driving, gravity is its job (no double comp).
             tau = tau + mj_data.qfrc_bias[self._arm_dof_idx]
-        mj_data.ctrl[self._arm_act_idx] = tau
+        # The FR3's torque interface: the torque changes by at most TAU_RATE_MAX
+        # (libfranka's rate limiter; the joint actuators saturate at TAU_MAX).
+        if self._tau_prev is not None:
+            step = fr3_limits.TAU_RATE_MAX * float(mj_data.model.opt.timestep)
+            tau = self._tau_prev + np.clip(tau - self._tau_prev, -step, step)
+        self._tau_prev = np.array(tau, dtype=float)
+        mj_data.ctrl[self._arm_act_idx] = self._torque_response(self._tau_prev, float(mj_data.model.opt.timestep))
 
         self._apply_gripper_control(mj_data)
+
+    def _torque_response(self, tau: np.ndarray, dt: float) -> np.ndarray:
+        """The joints' torque for the commanded ``tau``: ``torque_delay`` steps
+        late, then a first-order lag of ``torque_lag``."""
+        self._tau_sent.append(tau)
+        steps = np.rint(self._torque_delay / dt).astype(int)
+        del self._tau_sent[:max(len(self._tau_sent) - int(steps.max()) - 1, 0)]
+        delayed = np.array([self._tau_sent[max(len(self._tau_sent) - 1 - k, 0)][j] for j, k in enumerate(steps)])
+        if self._tau_act is None:
+            self._tau_act = delayed.copy()
+        self._tau_act = self._tau_act + dt / (self._torque_lag + dt) * (delayed - self._tau_act)
+        return self._tau_act.copy()
 
     def _width(self, mj_data: mj.MjData) -> float:
         return rq.mj_width(mj_data.model, mj_data)

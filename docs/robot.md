@@ -271,14 +271,37 @@ Objects for the real experiments (paper Sec. III-B): `blue_bowl`, `red_cup`,
   preempt the running one. If the gripper still steps, the RS-485 round
   trip (NUC bridge) is the limit: lower `width_stream_freq` to 25 Hz (the
   lead grows with the period, the motion stays continuous).
-* **Speed.** The defaults are now fast (`hrg.v_const` 0.8 m/s, lift 0.8 m/s,
-  the FR3's acceleration limits; docs/method.md "Speed"). Start on the robot
-  with `--hrg.v_const 0.3 --grasp.lift_speed 0.3` and raise them. What to
-  watch: the FR3's collision reflex (external-torque estimate; model errors
-  grow with acceleration; thresholds in `hardware.yaml`), the velocity brake
-  (`max_joint_vel`), and the gripper stream above. `scripts/diagnose_tracking.py`
-  is for the sim; on the robot compare `qd_des` with `qd` from a recorded
-  bus the same way.
+* **Speed.** The defaults are fast (`hrg.v_const` 0.5 m/s, also the top speed
+  of the hand chasing a moved object, and of the lift; docs/method.md "Speed").
+  The QP plans within 0.8 of the FR3's own joint velocity limits, which fall
+  toward the ends of each joint's range (`fr3/robot_platform/fr3_limits.py`),
+  and at its 10 rad/s² acceleration limit; `run_hardware.py` brakes above 0.9
+  of those limits. Each plan's torque (`M a + g + C v`, the feed-forward)
+  stays within 0.8 of the FR3's torque and torque rate (87 / 12 Nm,
+  1000 Nm/s), and the controller ramps it at that rate
+  (`joint_torque_limit_scale`). (2026-11-02: chasing a bowl moved by hand,
+  the hand went to 1.1 m/s and the robot stopped with
+  `joint_velocity_violation`, then `power_limit_violation`; with that fixed,
+  the recorded bus showed the plans asking for torque steps of 20–49 Nm in
+  1 ms and 139 Nm of joint 2: libfranka rate-limited them, the lift
+  overshot 2.2 cm and joints 1 / 3 shook into `power_limit_violation`. With
+  that fixed, the lift start still shook joints 1 / 3 at 8 Hz, once into the
+  power limit: the plans switched accelerations faster than the robot's
+  torque follows (1–7 ms dead time, 12–38 ms lag, from the flight recorder),
+  and the held bowl's table rows kicked the arm at the grasp. Now each
+  joint's acceleration changes at most 300 rad/s³ (`joint_jerk_limit`), the
+  held rows never demand separation, and the lift goes at 0.5 m/s. The
+  simulation has that torque response, `configs/sim/env.yaml`.)
+  What to watch: the FR3's collision reflex
+  (external-torque estimate; model errors grow with acceleration;
+  thresholds in `hardware.yaml`) and the gripper stream above.
+* **When the robot stops (red lights).** `run_hardware.py` prints the
+  robot's reasons and saves the last 3 s of its 1 kHz loop to
+  `outputs/logs/reflex_<time>.npz` (q, dq, tau_J, the commanded velocity,
+  the torque sent). Press `x` in the controller, then `r` in the hardware
+  terminal to recover (no restart). To record a whole run for analysis
+  (`qd_des` against `qd`, the lift, the object pose), log the bus:
+  `lcm-logger -c "franka_.*" outputs/logs/bus_$(date +%Y%m%d_%H%M%S).lcm`.
 * **Trigger.** 1.5 cm (the paper's robot value) absorbs pose-estimation
   noise; watch the fingertip error the controller prints when it closes.
 * **The cell.** The controller's walls (`configs/robot/controller.yaml`,

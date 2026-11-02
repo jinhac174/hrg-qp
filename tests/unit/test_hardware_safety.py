@@ -21,13 +21,14 @@ Q0 = np.array([0, 0, 0, -np.pi / 2, 0, np.pi / 2, 0])
 class FrozenBackend(FakeBackend):
     """Robot that does not move (state fixed), records the torques."""
 
-    def __init__(self, dq=None):
+    def __init__(self, dq=None, q=None):
         super().__init__(Q0)
+        self.q = Q0.copy() if q is None else np.asarray(q, float)
         self.dq = np.zeros(7) if dq is None else np.asarray(dq, float)
         self.sent = []
 
     def state(self):
-        return Q0.copy(), self.dq.copy(), np.zeros(7)
+        return self.q.copy(), self.dq.copy(), np.zeros(7)
 
     def set_torque(self, tau):
         self.sent.append(np.asarray(tau).copy())
@@ -127,6 +128,66 @@ def test_velocity_brake_damps_excess_only(hw):
     tau = step(hw, 50)
     assert not hw._vel_stopped  # keeps following the controller
     assert tau[0] < -1.0 and np.allclose(tau[1:], 0.0, atol=1e-9)
+
+
+def test_velocity_brake_follows_the_fr3_limit_where_it_is_lower(hw):
+    """Joint 4 near the end of its range: the FR3 stops it above 1.42 rad/s
+    toward that end, well below max_joint_vel (2): the brake already damps
+    1.4 rad/s there, and not the same speed away from the end."""
+    hw._vel_mode = "brake"
+    q = Q0.copy()
+    q[3] = -2.68
+    hw._backend.q = q
+    hw._hold_q = q.copy()
+    hw._backend.dq = np.r_[0, 0, 0, -1.4, 0, 0, 0]  # toward the lower end
+    send(hw, q, kp=np.zeros(7))
+    tau = step(hw, 50)
+    assert tau[3] > 1.0 and np.allclose(np.delete(tau, 3), 0.0, atol=1e-9)
+    hw._backend.dq = np.r_[0, 0, 0, 1.4, 0, 0, 0]  # away from it
+    tau = step(hw, 50)
+    assert abs(tau[3]) < 1e-9
+
+
+def test_robot_error_saves_the_last_seconds(hw, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    send(hw, Q0, kp=np.zeros(7), qd_des=np.full(7, 0.1))
+    step(hw, 20)
+    hw._on_error(RuntimeError("reflex"))
+    files = list((tmp_path / "outputs" / "logs").glob("reflex_*.npz"))
+    assert len(files) == 1 and hw._error
+    r = np.load(files[0])
+    assert r["q"].shape == (20, 7) and np.allclose(r["qd_des"], 0.1) and np.allclose(r["q"], Q0)
+
+
+def test_a_reflex_in_panda_pys_thread_is_reported():
+    """panda-py runs the torque loop in its own thread: a reflex ends it there while
+    is_moving() stays True and get_state() keeps the last state (the robot, 2026-11-02).
+    raise_error() reports it; without an error the state is read as usual."""
+    from types import SimpleNamespace
+
+    from fr3.robot_platform.hardware.franka_fr3.HardwareFrankaFR3 import PandaPyBackend
+
+    class Panda:
+        error = None
+
+        def is_moving(self):
+            return True
+
+        def raise_error(self):
+            if self.error:
+                raise RuntimeError(self.error)
+
+        def get_state(self):
+            return SimpleNamespace(q=list(Q0), dq=[0.0] * 7, tau_J=[0.0] * 7)
+
+    b = object.__new__(PandaPyBackend)
+    b._panda, b._ctrl = Panda(), object()
+    q, _, _ = b.state()
+    assert np.allclose(q, Q0) and b._ctrl is not None
+    b._panda.error = 'libfranka: Move command aborted: motion aborted by reflex! ["power_limit_violation"]'
+    with pytest.raises(RuntimeError, match="power_limit_violation"):
+        b.state()
+    assert b._ctrl is None
 
 
 def test_velocity_stop_and_release(hw):

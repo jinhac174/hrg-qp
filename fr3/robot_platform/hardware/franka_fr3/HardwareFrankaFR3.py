@@ -28,10 +28,17 @@ Safety layer (on top of the robot's own reflexes):
   and which jerk the arm.
 * ``ctrl_timeout``: without fresh commands (controller stopped / crashed / not
   started yet, or sending NaN / inf) the arm holds where it is with a soft PD.
-* ``max_joint_vel``: above it, ``velocity_limit: brake`` (default) adds
+* joint speed: above ``max_joint_vel``, or above ``joint_vel_limit_scale``
+  times the FR3's own position-dependent limit (``fr3_limits``: it falls
+  toward the ends of each joint's range, and the robot stops above it,
+  ``joint_velocity_violation``), ``velocity_limit: brake`` (default) adds
   damping on the excess speed of that joint only (``vel_brake_kd``), the
   controller keeps control; ``velocity_limit: stop`` switches to hold and
   stays there until key ``h`` releases.
+* a robot error (reflex, red lights) is reported with the robot's reasons,
+  and the last ``record_seconds`` of the 1 kHz loop (measured q, dq, tau_J,
+  the commanded velocity and the torque sent) are saved to
+  ``outputs/logs/reflex_<time>.npz``; key ``r`` recovers.
 
 Keys (hardware terminal): ``q`` quit, ``h`` clear a velocity stop,
 ``r`` recover from a robot error (reflex) and restart torque control.
@@ -40,6 +47,7 @@ Keys (hardware terminal): ``q`` quit, ``h`` clear a velocity stop,
 from __future__ import annotations
 
 import copy
+import os
 import queue
 import threading
 import time
@@ -51,13 +59,14 @@ from fr3.data_type.basic_types.GripperCmdData import GripperCmdData
 from fr3.data_type.basic_types.GripperStateData import GripperStateData
 from fr3.data_type.basic_types.JointCtrlData import JointCtrlData
 from fr3.data_type.basic_types.JointMeasData import JointMeasData
+from fr3.robot_platform import fr3_limits
 from fr3.robot_platform.gripper import robotiq_2f85 as rq
 from fr3.robot_platform.hardware.BaseHardwarePlatform import BaseHardwarePlatform
 from fr3.robot_platform.hardware.franka_fr3.robotiq import FakeRobotiqTransport, RobotiqGripper
 
 N = 7
-FR3_TAU_MAX = np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0])
-FR3_DQ_MAX = np.array([2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26])
+FR3_TAU_MAX = fr3_limits.TAU_MAX
+FR3_DQ_MAX = fr3_limits.DQ_MAX
 # Default pose for move_to_start: [0, 0, 0, -90°, 0, 90°, 0] (joint 7 = 0, DROID).
 FR3_HOME_Q = [0.0, 0.0, 0.0, -np.pi / 2, 0.0, np.pi / 2, 0.0]
 GRIPPER_MASS = 0.925  # kg: Robotiq 2F-85 + mount (CoM 5.2 cm along flange z)
@@ -135,6 +144,14 @@ class PandaPyBackend:
             print("[FR3] Did not reach the start pose; torque control starts where the arm is.")
 
     def state(self):
+        if self._ctrl is not None:
+            # The torque loop runs in panda-py's thread: a reflex ends it there, silently here
+            # (is_moving() stays True and get_state() keeps returning the last state).
+            try:
+                self._panda.raise_error()
+            except RuntimeError as e:
+                self._ctrl = None
+                raise RuntimeError(f"torque control stopped by the robot: {e}") from e
         s = self._panda.get_state()
         return np.array(s.q), np.array(s.dq), np.array(s.tau_J)
 
@@ -236,6 +253,7 @@ class HardwareFrankaFR3(BaseHardwarePlatform):
         self._tau_rate_max = float(s.get("tau_rate_max", 1000.0))
         self._max_joint_error = float(s.get("max_joint_error", 0.1))
         self._dq_stop = np.asarray(s.get("max_joint_vel", 0.9 * FR3_DQ_MAX), dtype=float)
+        self._dq_limit_scale = float(s.get("joint_vel_limit_scale", 0.9))
         self._vel_mode = str(s.get("velocity_limit", "brake"))
         if self._vel_mode not in ("brake", "stop"):
             raise ValueError(f"safety.velocity_limit must be 'brake' or 'stop', got {self._vel_mode!r}")
@@ -245,6 +263,10 @@ class HardwareFrankaFR3(BaseHardwarePlatform):
         self._ctrl_timeout = float(s.get("ctrl_timeout", 0.1))
         self._hold_kp = np.asarray(s.get("hold_kp", [300, 300, 300, 300, 125, 75, 25]), dtype=float)
         self._hold_kd = np.asarray(s.get("hold_kd", [35, 35, 35, 15, 15, 15, 7]), dtype=float)
+        # Flight recorder: the last record_seconds of the loop, saved on a robot error.
+        n_rec = max(int(float(s.get("record_seconds", 3.0)) * float(config.get("hardware_freq", 1000))), 1)
+        self._rec = np.full((n_rec, 1 + 5 * N), np.nan)  # t, q, dq, tau_J, qd_des, tau sent (the FR3 adds its gravity)
+        self._rec_i = 0
 
         pm = config["pub_manager"]
         self._arm_ch = pm["arm_joint_meas_channel"]
@@ -405,7 +427,10 @@ class HardwareFrankaFR3(BaseHardwarePlatform):
             else:  # NaN / inf would pass np.clip: drop it (-> timeout hold)
                 print("[FR3] Non-finite command ignored.")
 
-        excess = np.maximum(np.abs(dq) - self._dq_stop, 0.0)
+        lo, hi = fr3_limits.joint_velocity_limits(q)
+        hi = np.minimum(self._dq_stop, self._dq_limit_scale * hi)
+        lo = np.maximum(-self._dq_stop, self._dq_limit_scale * lo)
+        excess = np.maximum(dq - hi, 0.0) + np.maximum(lo - dq, 0.0)  # speed beyond the limit, either way
         if self._vel_mode == "stop" and np.any(excess > 0) and not self._vel_stopped:
             self._vel_stopped = True
             self._hold_q = q.copy()
@@ -419,6 +444,7 @@ class HardwareFrankaFR3(BaseHardwarePlatform):
             if self._grav_rejected is None:  # first command of this controller
                 self._grav_rejected = self._lacks_gravity(q, dq)
         use_cmd = fresh and not self._vel_stopped and not self._grav_rejected
+        qd_des = np.zeros(N)
         if use_cmd:
             _, q_des, qd_des, tau_ff, kp, kd = self._last_cmd.get_data()
             q_des = np.clip(q_des, q - self._max_joint_error, q + self._max_joint_error)
@@ -439,6 +465,8 @@ class HardwareFrankaFR3(BaseHardwarePlatform):
         step = self._tau_rate_max * self._update_dt
         tau = self._tau_prev + np.clip(tau - self._tau_prev, -step, step)
         self._tau_prev = tau
+        self._rec[self._rec_i % len(self._rec)] = np.r_[now, q, dq, tau_J, qd_des, tau]
+        self._rec_i += 1
         try:
             self._backend.set_torque(tau)
         except Exception as e:  # noqa: BLE001
@@ -475,6 +503,24 @@ class HardwareFrankaFR3(BaseHardwarePlatform):
     def _on_error(self, e):
         self._error = True
         print(f"[FR3] Robot error: {e}\n[FR3] Torque control stopped. Fix the cause, then press r.")
+        self._save_record()
+
+    def _save_record(self):
+        """The flight recorder (the loop's last seconds, oldest first) to
+        outputs/logs/reflex_<time>.npz."""
+        n = min(self._rec_i, len(self._rec))
+        if n == 0:
+            return
+        k = np.arange(self._rec_i - n, self._rec_i) % len(self._rec)
+        r = self._rec[k]
+        os.makedirs(os.path.join("outputs", "logs"), exist_ok=True)
+        path = os.path.join("outputs", "logs", f"reflex_{time.strftime('%Y%m%d_%H%M%S')}.npz")
+        lo, hi = fr3_limits.joint_velocity_limits(r[-1, 1:1 + N])
+        np.savez(path, t=r[:, 0], q=r[:, 1:1 + N], dq=r[:, 1 + N:1 + 2 * N], tau_J=r[:, 1 + 2 * N:1 + 3 * N],
+                 qd_des=r[:, 1 + 3 * N:1 + 4 * N], tau=r[:, 1 + 4 * N:1 + 5 * N])
+        print(f"[FR3] The last {r[-1, 0] - r[0, 0]:.1f} s saved to {path}. Last dq "
+              f"{np.round(r[-1, 1 + N:1 + 2 * N], 2).tolist()} rad/s, FR3 limits here "
+              f"{np.round(lo, 2).tolist()} .. {np.round(hi, 2).tolist()}")
 
     # ------------------------------------------------------------ gripper
     def _dispatch_gripper_cmds(self):

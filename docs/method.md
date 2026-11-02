@@ -106,7 +106,11 @@ over the first 2 cm of the path (`fields.path_direction`), not its first
 millimetre from plan to plan, and on a moving target that turned the first
 segment by tens of degrees between plans. On a moving object the targets'
 own velocity is added (feed-forward: the field alone trails a moving target
-by `v_obj / K`, 3.5 cm at 0.35 m/s).
+by `v_obj / K`, 3.5 cm at 0.35 m/s), the fingertip speed still at most
+`v_const` (one factor for both fingertips): an object moved faster than that
+is chased at `v_const` and caught as it slows. Followed at its own speed, an
+object moved by hand took the hand to 1.1 m/s and the arm past the FR3's
+velocity limits (the robot stopped, 2026-11-02).
 
 ### Eqs. (6)-(8), grasp stability — `fields.grasp_stability_field`
 
@@ -143,9 +147,13 @@ min_z  Σ_i |xdot_i,des − J_i z|² + α Σ_i |ω_i,des − J_ω z|² + β |wdo
 s.t.   Γ(q) + dΓ/dz z H >= ε_Γ                     robot vs walls / floor, robot vs itself
        d(X(q,w), O) + dd/dz z H >= ε_O + r         hand spheres vs object, table, obstacles
        q_min <= q + qdot H <= q_max,  0 <= w + wdot H <= 85 mm
-       |qdot| <= qdot_max,  |wdot| <= 150 mm/s
+       s qdot_lo(q) <= qdot <= s qdot_hi(q),  |qdot| <= qdot_max,  |wdot| <= 150 mm/s
        |z − z_prev| <= a Δt_plan                     acceleration limits (joints, width)
-(infeasible only: the two distance rows get slacks s >= 0, + ρ Σ s + |s|² in the cost)
+       |M(q) â + g(q) + C(q, v) v| <= s_τ τ_max,  |M(q) (â − â_prev)| <= s_τ τ̇_max Δt_plan
+       |â − â_prev| <= j Δt_plan     â = (qdot − v) / Δt_plan, v = the previous plan
+                                                      torque, torque rate, jerk
+(infeasible only: the distance rows get slacks s >= 0, + ρ Σ s + |s|² in the cost; the torque
+ rows too only if they conflict with the box)
 ```
 
 * `H = 0.10` s. Margins: object 1 cm, obstacles 2 cm, table 5 mm, Γ 2 cm.
@@ -167,17 +175,59 @@ s.t.   Γ(q) + dΓ/dz z H >= ε_Γ                     robot vs walls / floor, r
   whenever a reach stalls or hovers next to the object. With `H = 0.10` s
   the same state settles within 1 mm of the margin with no oscillation, and
   reaches away from any margin are unchanged (same lift times to 0.1 s).
+* **[FR3]** `qdot_lo(q)`, `qdot_hi(q)`: the FR3's own joint velocity limits
+  (`fr3/robot_platform/fr3_limits.py`, libfranka 0.17.0). They depend on
+  the joint's position and direction (the speed from which it still stops
+  before its end) and fall far below the nominal 2.62 rad/s toward the ends
+  of the range: joint 4 at −2.68 rad may move toward its end at 1.42 rad/s.
+  The robot stops itself above them (`joint_velocity_violation`), so the QP
+  plans within `s = 0.8` of them (`joint_velocity_limit_scale`: the arm
+  follows a command with ~0.1 rad/s of error at speed); `qdot_max` (2 rad/s
+  on joints 1–4, 2.5 on the wrist) caps them. With the fixed 2 rad/s alone,
+  a chased object took joint 4 to 135 % of its limit there.
 * **[FR3]** `|z − z_prev| <= a Δt_plan`: the velocity may change by at most
-  the joint acceleration limits `a` = [10 ×4, 15, 20, 20] rad/s² (the
-  FR3's) and 2 m/s² for the width over one plan period (`z_prev` the
-  previous plan). The paper's QP is first order: its velocity may jump,
+  the joint acceleration limits `a` = 10 rad/s² on every joint (the FR3's:
+  FCI documentation, libfranka) and 2 m/s² for the width over one plan
+  period (`z_prev` the previous plan). The paper's QP is first order: its velocity may jump,
   and a torque-controlled arm realises the jump with a lag the rows know
   nothing about. Bounded, the plan is a velocity profile the arm can
   follow, and the low level (Sec. II-D) realises exactly it. See "Speed".
+* **[FR3]** The torque rows: the torque the profile asks of the arm, the low
+  level's feed-forward `M â + g + C v`, within `s_τ = 0.8` of the FR3's
+  torque (87 Nm on joints 1–4, 12 on 5–7) and its change from the previous
+  plan within `s_τ` of the FR3's torque rate (1000 Nm/s, libfranka) over the
+  period: 8 Nm per plan (`joint_torque_limit_scale`; the rest is the Kd
+  feedback's and a held object's). The per-joint acceleration box alone does
+  not bound either: `M(q)` couples the joints (joint 1 carries
+  `M_13 ≈ 2 kg m²` of joint 3's acceleration), so 10 rad/s² on every joint at
+  once asked for torque steps of 20–49 Nm within one millisecond and, on a
+  lift far out, 139 Nm of joint 2. On the robot (2026-11-02, recorded with
+  `lcm-logger`) libfranka rate-limited the steps and joint 2 saturated: the
+  torque arrived 20–60 ms late, the arm overshot the lift by 2.2 cm and came
+  back, and on a fast reach the late Kd term drove joints 1 and 3 against
+  each other at 8 Hz (their antiphase mode weighs only 0.27 kg m²) until a
+  `power_limit_violation` stopped the robot. From rest the acceleration now
+  builds over a few plans (the first plan moves the hand a few cm/s); the
+  reaches and lifts take the same time.
+* **[FR3]** The jerk rows: each joint's acceleration changes from the previous
+  plan's by at most `j Δt_plan`, `j = 300 rad/s³` (`joint_jerk_limit`). The
+  FR3's link-side torque follows its command 1–7 ms late and with a 12–38 ms
+  first-order lag (joint 1 the slowest), fitted to the flight recorder of a
+  stop (`outputs/logs/reflex_20261102_174526.npz`, the torque sent against
+  `tau_J`), so an acceleration reaches a joint over ~30 ms: `10 rad/s² / 30 ms`.
+  Plans that switched joints between ±10 rad/s² from one period to the next
+  (the QP riding its box toward a field's demand) asked for more, and on
+  light directions, which the torque rows let change fast (joints 1 and 3
+  turning against each other weigh 0.17–0.28 kg m² at the lift), the arm
+  fell behind and the Kd term drove an 8 Hz oscillation. The simulation
+  with that torque response (`configs/sim/env.yaml`) reproduces it: without
+  the jerk rows it shook from the low start poses, with them the joint 1 / 3
+  counter-motion stays below 0.9 rad/s.
 * **[FR3]** The rows are solved hard first (the paper's QP). Only when that
   is infeasible — inside a margin, the arm at rest and the acceleration
-  limit between it and the demanded separation rate, e.g. the held bowl's
-  table rows at the start of the lift — they are relaxed through slacks
+  and torque limits between it and the demanded separation rate, e.g. the
+  rows of an obstacle in the way — the distance rows are
+  relaxed through slacks
   `s >= 0` with the linear penalty `ρ Σ s`, `ρ = 100` (plus a small `|s|²`
   that keeps OSQP converging). A linear penalty is exact: above the
   tracking cost's gradient (at most `2 |v| ≈ 2` for a 1 m/s field) every
@@ -185,8 +235,10 @@ s.t.   Γ(q) + dΓ/dz z H >= ε_Γ                     robot vs walls / floor, r
   hard one's optimum whenever that exists, and otherwise returns the
   fastest recovery the box allows instead of nothing. (Solving the slack
   form always was slower and, with the box's 95 rows, OSQP sometimes ran
-  out of iterations.) A failed solve brakes toward rest at the acceleration
-  limit.
+  out of iterations.) The torque rows are relaxed the same way only if they
+  conflict with the box itself (a velocity limit approached faster than the
+  torque rate can turn): what the arm can do comes first, then the margins.
+  A failed solve brakes toward rest at the acceleration limit.
 * `1e-3 |z|²`: with `α = β = 0` near the target the cost constrains six of
   the eight velocities (two fingertips × 3); the regulariser picks the
   smallest motion for the rest.
@@ -226,8 +278,9 @@ q_des  = q + qd_cmd dt
   next to 50), the same direction: `Kp = 0`. The law is a damping (velocity)
   controller, `Kd = [50 ×3, 20 ×3, 10]`; position is fed back by the planner,
   which solves the QP at the measured state every 10 ms. States that command
-  no motion (idle, close, reopen, hold) hold the joints through the planner
-  (`hold_gain (q_hold − q)`), not through Kp.
+  no motion (idle, reopen) hold the joints through the planner
+  (`hold_gain (q_hold − q)`), not through Kp; holding a lifted object keeps
+  the lift's goal pose (below).
 * **[FR3]** That leaves joint friction and gravity-model errors unhidden: an
   unmodelled torque Δτ becomes a velocity error Δτ / Kd. Hence the friction
   feed-forward `τ_f` (`hrg/friction.py`): `scale (f_c tanh(qdot_des / v_s) +
@@ -252,10 +305,11 @@ q_des  = q + qd_cmd dt
   to cover, and at speed it is the distance `v × lag` by which a margin is
   overshot. With the feed-forward the arm follows the planned velocity
   profile by construction and `Kd` only corrects errors: the lag falls to
-  2–9 ms on every joint (the plan period), and the plans change by at most
-  the acceleration limits per period (eq. 11), so the ramp's acceleration is
-  what the robot can do and the torque has no steps (libfranka rejects
-  them). The earlier first-order filter on `qdot_des` is gone: the ramp
+  2–9 ms on every joint (the plan period). The plans keep `M â` within the
+  FR3's torque and its change within the torque rate (eq. 11), and the low
+  level moves `M(q) qdd_cmd` to each plan's value at that rate (0.8 Nm per
+  ms): a ramp within the period, not a step that libfranka rate-limits and
+  that holds back the Kd term with it. The earlier first-order filter on `qdot_des` is gone: the ramp
   between plans is the filter, and it is exact. If no plan arrives for
   0.2 s the joints are held where they were (`stale_hold_kp` / `kd`).
 * **[2F-85]** The Robotiq is position-servoed (and so is its sim), with a
@@ -292,9 +346,13 @@ object is lifted."
   gripper opens and the reach starts again. If the object is lost during the
   lift or hold, the same happens.
 * Lift: the TCP 15 cm straight up through the same QP (a pose field as the
-  task, saturated at 0.8 m/s with gain 8 /s; `Γ` and the hand vs table /
+  task, saturated at 0.5 m/s with gain 8 /s; `Γ` and the hand vs table /
   obstacles as constraints, plus 64 points of the held object vs the
-  table; 0.4 s), then (not in the paper) **upright**: the
+  table, 2 cm: a point closer than that, as at the grasp, may only not come
+  closer; demanding the margin back from rest was infeasible and the
+  fallback raised the bowl the fastest way the box allowed, a kick through
+  every joint at its acceleration limit that set off the oscillation on the
+  robot; 0.4 s), then (not in the paper) **upright**: the
   hand pose that puts the object back in its upright pose (object `+z` up,
   the smallest tilt about the TCP, raised until it clears the table by
   3 cm), from the object's pose in the hand recorded when the gripper
@@ -302,6 +360,14 @@ object is lifted."
   turn when plausible (the grasped point still within 2 cm between the pads,
   the object turned at most 45°): a bowl or glass that pivoted in the
   fingers is corrected, twice at most. Then hold.
+* **One goal from the grasp on.** The upright turn keeps the lift's goal
+  position, and the hold keeps the final goal pose (the same pose field):
+  the hand never gets a new goal where it happens to be when a state ends.
+  The lift ends within 1 cm of its goal, still rising; re-anchored there
+  (the upright goal at the current position, the hold at the joints at
+  entry) it overshot that point and came back down, visibly on the robot
+  (2026-11-02; 2 mm in the simulation, where the arm follows with less
+  lag). Now the height rises monotonically to the goal and stays.
 
 ## Beyond the paper: the oriented reach — `planner._select_oriented`, `targets`, `fields`
 
@@ -367,9 +433,9 @@ R* = R_obj R_grasp,j,k (· Rz(π) for the other finger order)
 | Selection weight `w` (eq. 12) | 0.05 m/rad |
 | `K` (eq. 2) | 1 /s |
 | `η_g, T_g, η_h, T_h, δ_gr, v_gr` | 0.15 rad, 0.05, 6 cm, 2 cm, 2 cm, 0.15 m/s |
-| `v_const`, `δ_x` (eq. 5) | 0.8 m/s, 8 cm (the paper: 0.15 m/s, 5 cm); see "Speed" |
+| `v_const`, `δ_x` (eq. 5) | 0.5 m/s, 10 cm (the paper: 0.15 m/s, 5 cm); see "Speed" |
 | `H`, margins | 0.10 s (the stopping time: `v <= a H`, see "Speed"); object 1 cm (paper), obstacles 5 cm in eq. (3) (paper), 2 cm in eq. (11) |
-| Acceleration limits (not in the paper) | the FR3's [10 ×4, 15, 20, 20] rad/s², the width 2 m/s² |
+| Velocity, acceleration, torque limits | 0.8 × the FR3's position-dependent velocity limits within 2 / 2.5 rad/s; the FR3's 10 rad/s² (not in the paper), the width 2 m/s²; the plan's torque within 0.8 × the FR3's torque and torque rate (87 / 12 Nm, 1000 Nm/s); jerk 300 rad/s³ (the robot's torque lag) |
 | Start poses "left-bottom, center-up, right-bottom" | `hrg/study.py`: the ready pose, and the gripper pointing down 27 cm to either side with the fingertips at rim height |
 | GPU nearest-neighbour / via search | CPU (KD-tree, NumPy); plans take 3–15 ms |
 
@@ -384,19 +450,25 @@ the target, decaying over `δ_x`, linear near the target with gain
 `K = 2 v_const / δ_x`. The alignment (oriented reach): `k θ` capped at
 `ω_max` (3 /s, 1.5 rad/s). The posture task toward `q_grasp` (3 /s). The
 width field (eq. 9, 0.15 m/s). After the grasp: the lift's pose field
-(0.8 m/s, 8 /s; 2 rad/s, 5 /s), the hold (10 /s, 1 rad/s), home (2 /s).
+(0.5 m/s, 8 /s; 2 rad/s, 5 /s), the joint hold (10 /s, 1 rad/s), home (2 /s).
+The robot brakes about one torque lag (~25 ms) after its plan, so a hand
+stopping from `v` overshoots by about `v × 25 ms`: 1.6 cm from 0.8 m/s in the
+simulation with the robot's torque response, none from 0.5 m/s.
 Raising these is what makes the robot move faster; everything below only
 says how far they can be raised.
 
-**Bounded by the QP (eq. 11).** The joint velocity limits (2 rad/s on
-joints 1–4, 2.5 on the wrist; the hardware brakes above 2 / 3) are not
-binding below about 1 m/s of hand speed. The distance rows are: linearised
+**Bounded by the QP (eq. 11).** The joint velocity limits (0.8 of the
+FR3's own at the current joints, within 2 rad/s on joints 1–4 and 2.5 on
+the wrist; the hardware brakes above 0.9 of the FR3's, and above 2 / 3) bind
+only near the ends of the joints' ranges at the speeds here. The fingertip
+speed is at most `v_const` also on a moving object. The distance rows bind: linearised
 over `H`, a row lets the hand approach a margin at `(d − ε)/H`, so the hand
 starts braking `v H` before any margin (5 cm at 0.5 m/s) and then closes in
 with the time constant `H`. The required deceleration is `v/H`, so the
 rows are only satisfiable while **`v <= a H`**, with `a` the hand's
 acceleration (5–8 m/s² at the FR3's joint acceleration limits over the
-arm's lever). And the eq. (5) decay itself must be feasible: its peak
+arm's lever; less where the torque rows bind, and it builds up over a few
+plans at the torque rate). And the eq. (5) decay itself must be feasible: its peak
 deceleration is about `1.5 v_const² / δ_x`, 3.8 m/s² at 0.5 m/s and 10 cm.
 (0.8 m/s with 8 cm asks for 12 m/s²: the plans then ride the acceleration
 bounds and the arm visibly shakes; `v_const` was lowered from 0.8 to 0.5
@@ -404,7 +476,9 @@ for that reason, at a cost of 0.25 s on a reach.) The acceleration bounds
 in the QP are what makes this consistent: without them the QP's velocity
 could jump and the rows could demand more braking than the arm has; with
 them, and the slack fallback, the QP always returns the fastest motion the
-arm can make.
+arm can make. The torque rows add what the per-joint box cannot see: the
+joints' accelerations together, through `M(q)`, within the torque the FR3
+has and the rate at which it changes it.
 
 **Realised by the low level (Sec. II-D).** The velocity ramp between plans
 and the inertia feed-forward make the arm follow the planned velocity

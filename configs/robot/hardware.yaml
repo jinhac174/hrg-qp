@@ -64,12 +64,19 @@ safety:
   # q_des is clamped to q +/- this (rad): a controller that jumps its set-point
   # far away only gets a bounded spring force.
   max_joint_error: 0.1
-  # Joint speed limits (rad/s). velocity_limit: brake = damp the speed above
-  # the limit (vel_brake_kd, Nm per rad/s of excess) and keep following the
+  # Joint speed limits (rad/s): max_joint_vel, and joint_vel_limit_scale times the
+  # FR3's own limit at the current joints (it falls toward the ends of each joint's
+  # range: fr3/robot_platform/fr3_limits.py; the robot stops above it, reflex
+  # joint_velocity_violation). velocity_limit: brake = damp the speed above the
+  # limit (vel_brake_kd, Nm per rad/s of excess) and keep following the
   # controller; stop = hold the pose until you press h.
   max_joint_vel: [2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0]
+  joint_vel_limit_scale: 0.9
   velocity_limit: brake
   vel_brake_kd: [20, 20, 20, 20, 5, 5, 2]
+  # On a robot error (reflex) the last record_seconds of the loop go to
+  # outputs/logs/reflex_<time>.npz (q, dq, tau_J, the commanded velocity, the torque sent).
+  record_seconds: 3.0
   # No command for this long (s): hold the current pose with hold_kp / hold_kd.
   ctrl_timeout: 0.1
   hold_kp: [300, 300, 300, 300, 125, 75, 25]

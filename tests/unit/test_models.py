@@ -180,3 +180,17 @@ def test_link_side_torque_at_rest_is_gravity_load():
     tau_J = plat._link_side_torque(data)
     g = data.qfrc_bias[plat._arm_dof_idx]  # at rest, bias = gravity
     assert np.allclose(tau_J, g, atol=0.3), (tau_J, g)
+
+
+def test_the_plants_torque_follows_the_command_with_the_fr3s_delay_and_lag():
+    """torque_delay / torque_lag: the joints' torque is the command, that many
+    steps late, through a first-order lag (the robot's flight recorder)."""
+    dt = 0.001
+    plat = SimFrankaFR3(torque_delay=[0.003] + [0.0] * 6, torque_lag=[0.0] * 6 + [0.01])
+    step = np.r_[1.0, np.zeros(5), 1.0]
+    out = [plat._torque_response(np.zeros(7), dt)] + [plat._torque_response(step, dt) for _ in range(40)]
+    out = np.array(out)
+    np.testing.assert_allclose(out[1:4, 0], 0.0)  # joint 1: 3 ms dead time
+    np.testing.assert_allclose(out[4:, 0], 1.0)
+    assert 0.6 < out[10, 6] < 0.7 and out[40, 6] > 0.97  # joint 7: ~63 % after one time constant
+    np.testing.assert_allclose(out[1:, 1:6], 0.0)

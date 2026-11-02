@@ -75,9 +75,26 @@ hrg:
 # Gamma(q) of eq. (11): robot vs environment (the scene's floor / wall_* geoms,
 # published by the env / run_hardware.py) and vs itself.
 joint_velocity_limit: [2, 2, 2, 2, 2.5, 2.5, 2.5]           # rad/s (hardware.yaml brakes above its max_joint_vel)
+# The FR3's own velocity limits fall toward the ends of each joint's range (fr3/robot_platform/
+# fr3_limits.py; joint 4 at -2.68 rad: 1.42 rad/s toward its end) and the robot stops above them
+# (joint_velocity_violation). The QP plans within this fraction of them: the arm follows a
+# command with an error (~0.1 rad/s at speed).
+joint_velocity_limit_scale: 0.8
 # The QP changes its velocity by at most these per plan period (|z - z_prev| <= a dt): the plan is
 # a profile the arm can follow, and the low level feeds the acceleration forward (hrg/lowlevel.py).
-joint_acceleration_limit: [10, 10, 10, 10, 15, 20, 20]    # rad/s^2, the FR3's limits
+joint_acceleration_limit: [10, 10, 10, 10, 10, 10, 10]    # rad/s^2, the FR3's limits (FCI docs, libfranka)
+# ... and the torque each plan asks of the arm, M(q) a + g(q) + C(q, v) v (the low level's feed-forward),
+# within this fraction of the FR3's torque (87 / 12 Nm) and torque rate (1000 Nm/s: per plan period,
+# M (a - a_prev) <= 8 Nm), the rest left to the Kd feedback and a held object. Faster changes reach the
+# robot rate-limited, late, and with them the Kd term: the arm lagged its plan by 50 ms, overshot the
+# lift by 2 cm and joints 1 / 3 shook until a reflex (2026-11-02, outputs/logs/bus_20261102_17*.lcm).
+joint_torque_limit_scale: 0.8
+# ... and each joint's acceleration changes by at most this per second (rad/s^3, per plan period
+# 3 rad/s^2): the FR3's torque follows its command 15-40 ms late (flight recorder, 2026-11-02),
+# so an acceleration reaches the joint over ~30 ms (10 rad/s^2 / 30 ms ~ 300 rad/s^3). Plans that
+# switched +-10 rad/s^2 from one period to the next kicked the light joint 1 / 3 counter-motion
+# (0.2 kg m^2) into an 8 Hz oscillation on the robot.
+joint_jerk_limit: [300, 300, 300, 300, 300, 300, 300]
 width_acceleration_limit: 2.0                              # m/s^2, the 2F-85's set-point response
 env_col_margin: 0.02
 self_col_margin: 0.02
@@ -149,7 +166,7 @@ grasp:
   lift_height: 0.15        # m
   lift_tol: 0.01           # m
   lift_timeout: 3.0        # s (a 15 cm lift takes ~0.4 s; near the reach limit it may not finish)
-  lift_speed: 0.8          # m/s
+  lift_speed: 0.5          # m/s, the reach's top speed: the arm brakes ~25 ms late (the torque lag), the hand overshoots by ~v x lag
   lift_angular_speed: 2.0  # rad/s
   lift_pos_gain: 8.0       # 1/s
   lift_rot_gain: 5.0       # 1/s

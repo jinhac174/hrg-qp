@@ -68,6 +68,75 @@ def test_plans_change_by_at_most_the_acceleration_limit(gold):
     assert peak > 0.5  # it does get up to speed
 
 
+def _plan_torques(p, q, z, z_prev, a_prev):
+    """The torque a plan asks of the arm (hrg.lowlevel's feed-forward): M (z - z_prev) / dt
+    + g + C v, and the change of its inertial part from the previous plan."""
+    d = p.robot.data()
+    M = p.robot.mass_matrix(q, d)
+    a = (z - z_prev) / p.plan_dt
+    return M @ a + p.robot.gravity_coriolis(q, z_prev, d), M @ (a - a_prev), a
+
+
+def test_plans_keep_the_feed_forward_torque_within_the_fr3s_torque_and_torque_rate(gold):
+    """On the robot the feed-forward of a plan is M(q) a + g + C v and libfranka passes
+    at most TAU_MAX and TAU_RATE_MAX: every plan of a fast reach and lift stays within
+    torque_limit_scale of both (a step of M (a - a_prev) per plan period)."""
+    from fr3.robot_platform import fr3_limits
+
+    p, o, T_obj = gold
+    s = p.robot.torque_limit_scale
+    tau_max, step = s * fr3_limits.TAU_MAX, s * fr3_limits.TAU_RATE_MAX * p.plan_dt
+    q, w = np.array(START_POSES["left_bottom"]), MAX_WIDTH
+    p.reset()
+    z_prev, a_prev = np.zeros(N_ARM), np.zeros(N_ARM)
+
+    def check(qd):
+        nonlocal z_prev, a_prev
+        tau, dtau, a = _plan_torques(p, q, qd, z_prev, a_prev)
+        assert np.all(np.abs(tau) <= tau_max + 0.05), tau
+        assert np.all(np.abs(dtau) <= step + 0.05), dtau
+        z_prev, a_prev = qd, a
+
+    for k in range(300):
+        r = p.step(q, w, T_obj)
+        check(r.qd)
+        q = q + r.qd * p.plan_dt
+        w = float(np.clip(w + r.wd * p.plan_dt, 0.0, MAX_WIDTH))
+        if np.all(np.linalg.norm(r.x - r.x_tgt, axis=1) < 0.01) and r.info["rot_err"] < np.radians(10):
+            break
+    T_goal = p.tcp_pose(q)
+    T_goal[2, 3] += 0.15
+    for k in range(150):
+        qd = p.lift_step(q, w, T_goal, 0.8, 2.0, 8.0, 5.0, 0.5)
+        check(qd)
+        q = q + qd * p.plan_dt
+
+
+def test_plans_change_their_acceleration_by_at_most_the_jerk_limit(gold):
+    """The FR3's torque follows its command 15-40 ms late: a plan changes each
+    joint's acceleration by at most joint_jerk_limit x the period (reach and lift)."""
+    p, _, T_obj = gold
+    dj = p.robot.qddd_limit * p.plan_dt
+    q, w = np.array(START_POSES["right_bottom"]), MAX_WIDTH
+    p.reset()
+    z_prev, a_prev = np.zeros(N_ARM), np.zeros(N_ARM)
+    for k in range(200):
+        r = p.step(q, w, T_obj)
+        a = (r.qd - z_prev) / p.plan_dt
+        assert np.all(np.abs(a - a_prev) <= dj + 0.05), k
+        z_prev, a_prev = r.qd, a
+        q = q + r.qd * p.plan_dt
+        w = float(np.clip(w + r.wd * p.plan_dt, 0.0, MAX_WIDTH))
+    T_goal = p.tcp_pose(q)
+    T_goal[2, 3] += 0.15
+    for k in range(100):
+        qd = p.lift_step(q, w, T_goal, 0.5, 2.0, 8.0, 5.0, 0.5)
+        a = (qd - z_prev) / p.plan_dt
+        assert np.all(np.abs(a - a_prev) <= dj + 0.05), k
+        z_prev, a_prev = qd, a
+        q = q + qd * p.plan_dt
+
+
 def test_first_plan_from_rest_is_small_and_a_moving_start_is_honoured(gold):
     p, _, T_obj = gold
     q = np.array(START_POSES["center_up"])
@@ -130,6 +199,35 @@ def test_velocity_ramp_reaches_each_plan_within_the_period_with_its_acceleration
     np.testing.assert_allclose(a, [10.0, 0.0])
     ramp.stop(0.03)
     np.testing.assert_allclose(ramp.at(0.03)[0], 0.0)
+
+
+def test_the_inertial_feed_forward_ramps_at_the_torque_rate_the_plans_are_bounded_by():
+    """A plan's change of acceleration reaches the torque as a ramp at
+    torque_limit_scale x TAU_RATE_MAX (no step for the FR3 to rate-limit),
+    complete within the plan period because the plans keep the change within it."""
+    from queue import Queue
+
+    from omegaconf import OmegaConf
+
+    from fr3.robot_platform import fr3_limits
+    from hrg.controller import HRGController, Plan
+
+    c = HRGController(OmegaConf.load("configs/controller.yaml"))
+    c._plan_que, c.ctrl_pub_que = Queue(maxsize=1), Queue()
+    q = np.array(START_POSES["center_up"])
+    c._q, c._qd, c._have_q = q.copy(), np.zeros(N_ARM), True
+    M = c._robot.mass_matrix(q, c._robot.data())
+    step = c._robot.torque_limit_scale * fr3_limits.TAU_RATE_MAX * c._ctrl_dt
+    a = np.linalg.solve(M, np.full(N_ARM, 0.9 * step * c._plan_dt / c._ctrl_dt))  # M a: 90 % of a period's change
+    c._plan_que.put(Plan(a * c._plan_dt))
+    sent = []
+    for k in range(int(round(c._plan_dt / c._ctrl_dt))):
+        c._cur_time = k * c._ctrl_dt
+        c._update()
+        sent.append(c._tau_inertia.copy())
+    d = np.diff(np.vstack([np.zeros(N_ARM), sent]), axis=0)
+    assert np.all(np.abs(d) <= step + 1e-9)
+    np.testing.assert_allclose(sent[-1], M @ a, rtol=1e-6)  # there within the period
 
 
 def test_width_stream_moves_the_fingers_continuously_at_the_commanded_rate():
@@ -263,15 +361,66 @@ def test_moving_object_rows_demand_the_extra_separation_and_targets_feed_forward
     assert rows.l[0] == pytest.approx(-0.4) and rows.l[1] == pytest.approx(-0.1)
     p, _, T_obj = gold
     q = np.array(START_POSES["center_up"])
-    p.reset()
-    r0 = p.step(q, MAX_WIDTH, T_obj)
-    p.reset()
-    v = np.array([0.0, 0.3, 0.0])
-    r1 = p.step(q, MAX_WIDTH, T_obj, obj_twist=(v, np.zeros(3)))
+
+    def settled(twist):  # q held, so the fields stay the same: the plan after the ramp from rest
+        p.reset()
+        for _ in range(40):
+            r = p.step(q, MAX_WIDTH, T_obj, obj_twist=twist)
+        return r
+
+    r0 = settled(None)
+    r1 = settled((np.array([0.0, 0.3, 0.0]), np.zeros(3)))
     # far from the object the QP tracks the fields: the fingertips gain the object's velocity
     from hrg.hand import fingertip_state
     T = p.robot.pose(q, p.robot.data())
     J = p.robot.jacobian(q, p.robot.data())
     _, Jx = fingertip_state(T, J, MAX_WIDTH)
     dv = np.einsum("fij,j->fi", Jx, np.r_[r1.qd - r0.qd, r1.wd - r0.wd])
-    assert np.all(dv[:, 1] > 0.05)  # (the acceleration bound from rest caps the first plan)
+    assert np.all(dv[:, 1] > 0.1)  # (v_const caps the sum)
+
+
+# ---------------------------------------------------------------- the FR3's limits
+def test_fr3_velocity_limits_fall_toward_the_ends_of_the_range():
+    from fr3.robot_platform import fr3_limits
+
+    lo, hi = fr3_limits.joint_velocity_limits(np.array(START_POSES["center_up"]))
+    assert np.all(lo < 0) and np.all(hi > 0)
+    q = np.array([0, 0, 0, -2.68, 0, 1.5, 0])
+    lo, hi = fr3_limits.joint_velocity_limits(q)
+    assert lo[3] == pytest.approx(0.30 - np.sqrt(8.0 * (q[3] + 3.0481)))  # libfranka 0.17.0
+    assert lo[3] == pytest.approx(-1.42, abs=0.01) and hi[3] == pytest.approx(2.62)
+    lo, hi = fr3_limits.joint_velocity_limits(np.array([0, 0, 0, -0.1518, 0, 1.5, 0]))  # joint 4 at its URDF end
+    assert hi[3] == 0.0
+
+
+def test_planned_velocities_stay_within_the_fr3_limits(gold):
+    from fr3.robot_platform import fr3_limits
+
+    p, _, _ = gold
+    rng = np.random.default_rng(3)
+    s = p.robot.velocity_limit_scale
+    for _ in range(200):
+        q = rng.uniform(p.robot.q_lower, p.robot.q_upper)
+        lo, hi = p.robot.velocity_bounds(q, p.p.horizon)
+        f_lo, f_hi = fr3_limits.joint_velocity_limits(q)
+        assert np.all(lo >= s * f_lo - 1e-12) and np.all(hi <= s * f_hi + 1e-12)
+
+
+def test_a_fast_object_is_chased_at_the_fields_top_speed(gold):
+    """The object's velocity is fed forward, but the fingertips' commanded
+    speed stays at most v_const however fast the object moves."""
+    from hrg.hand import fingertip_state
+
+    p, _, T_obj = gold
+    q = np.array(START_POSES["center_up"])
+    v_obj = np.array([0.0, 1.5, 0.0])  # moved by hand, fast
+    p.reset()
+    p.set_velocity(np.zeros(N_ARM))
+    d = p.robot.data()
+    for _ in range(60):  # past the acceleration ramp
+        r = p.step(q, MAX_WIDTH, T_obj, obj_twist=(v_obj, np.zeros(3)))
+        _, Jx = fingertip_state(p.robot.pose(q, d), p.robot.jacobian(q, d), MAX_WIDTH)
+        xd = np.einsum("fij,j->fi", Jx, np.r_[r.qd, r.wd])
+        assert np.all(np.linalg.norm(xd, axis=1) <= p.p.v_const + 0.05)
+        q = q + r.qd * p.plan_dt
+    assert np.max(np.linalg.norm(xd, axis=1)) > 0.8 * p.p.v_const  # it does chase

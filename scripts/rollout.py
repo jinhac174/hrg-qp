@@ -51,7 +51,9 @@ def make_planner(obj: str, field: str, overrides=()) -> tuple[ReachPlanner, Gras
     cfg.hrg.field = field
     o = GraspObject(f"configs/objects/{obj}.yaml")
     robot = RobotModel(cfg.urdf_path, cfg.joint_velocity_limit, cfg.col_pairs, cfg.self_col_pairs,
-                       cfg.env_col_margin, cfg.self_col_margin, cfg.get("joint_acceleration_limit"))
+                       cfg.env_col_margin, cfg.self_col_margin, cfg.get("joint_acceleration_limit"),
+                       float(cfg.get("joint_velocity_limit_scale", 0.8)), float(cfg.get("joint_torque_limit_scale", 0.8)),
+                       cfg.get("joint_jerk_limit"))
     robot.set_collision_geometry(*scene_collision_info(OmegaConf.load(resolve(ENV_CFG)).scene_xml_path))
     planner = ReachPlanner(HRGParams.from_config(cfg.hrg), robot,
                            FingertipTargets.load(resolve(o.cfg.fingertip_targets), o.cfg.get("approach_axis")),

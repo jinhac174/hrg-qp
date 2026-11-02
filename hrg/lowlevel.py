@@ -2,16 +2,23 @@
 
 Plans arrive at ``plan_freq`` (100 Hz) with a velocity ``z = (qdot, wdot)``
 that the QP changed by at most ``a plan_dt`` since the previous plan (its
-acceleration bounds, ``hrg.planner``). The control thread turns that sequence
-into a continuous profile and the torque::
+acceleration bounds, ``hrg.planner``), with a torque ``M a + g + C v`` within
+the FR3's and its change ``M (a - a_prev)`` within the FR3's torque rate over
+the period (``RobotModel.torque_bounds``). The control thread turns that
+sequence into a continuous profile and the torque::
 
     qd_cmd(t)  : linear ramp from the previous plan's value to the new one over
                  plan_dt, so qdd_cmd = (qd_new - qd_prev) / plan_dt is exactly the
                  acceleration the QP decided (piecewise constant)   (VelocityRamp)
     q_des      = q + qd_cmd dt                 the paper: "integrated over one control interval"
     tau        = Kp (q_des - q) + Kd (qd_cmd - qd)                      the paper's PD
-               + M(q) qdd_cmd                                           inertia feed-forward [FR3]
+               + [M(q) qdd_cmd]                                         inertia feed-forward [FR3]
                + g(q) + C(q, qd) qd + tau_f(qd_cmd) + tau_payload       gravity, Coriolis, friction, load
+
+``[M(q) qdd_cmd]`` moves toward its value at that torque rate (the controller):
+a plan's change arrives as a ramp within the period. As a step it reached the
+robot rate-limited by libfranka, late, and the Kd term with it: the arm lagged
+its plan by 50 ms and joints 1 / 3 shook until a reflex (2026-11-02).
 
 With ``Kp = 0`` (``Kp dt qd_cmd`` is 1 % of the Kd term) the paper's law is a
 velocity controller whose loop has the time constant ``M_ii / Kd_i``: 30-60 ms

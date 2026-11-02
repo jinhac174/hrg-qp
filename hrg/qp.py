@@ -12,7 +12,9 @@ limits and acceleration limits (``lb``, ``ub``: the box on ``z``). When a pair
 is already inside its margin, the demanded separation rate ``(eps - d)/H`` is
 capped at ``sep_rate_max`` while it recovers.
 
-The box on ``z`` is hard (it is what the arm can do). The distance rows are
+The box on ``z`` is hard (it is what the arm can do), and so are the
+``limits``: the torque a plan asks of the arm (``hrg.planner``), relaxed only
+if they conflict with the box itself. The distance rows are
 hard too whenever that problem is feasible (the paper's QP); when it is not,
 they are relaxed through slack variables ``s >= 0`` with the linear penalty
 ``rho sum s`` (``slack_weight``): ``a z + s >= lower``. A linear penalty is exact: with
@@ -77,13 +79,17 @@ class DistanceRows:
 
 
 def solve_tracking_qp(tasks, lb, ub, rows: DistanceRows | None = None, reg: float = 1e-3,
-                      slack_weight: float = 100.0, slack_quad: float = 1.0):
+                      slack_weight: float = 100.0, slack_quad: float = 1.0, limits=None):
     """``tasks``: list of ``(J (k, n), v (k,), weight)``. ``lb``/``ub``: the
-    box on ``z`` (hard). ``rows``: distance rows. The rows are first imposed
-    as hard constraints (the paper's QP, small and well conditioned); only
-    if that problem is infeasible are they relaxed through the penalised
-    slacks (module docstring), which has the same optimum whenever the hard
-    one is feasible. Returns ``z``, or ``None`` if OSQP fails on both."""
+    box on ``z`` (hard). ``rows``: distance rows. ``limits``: ``(A, l, u)``,
+    two-sided rows ``l <= A z <= u``: the torque a plan asks of the arm
+    (``hrg.planner``), what the arm can do like the box. Everything is first
+    imposed as hard constraints (the paper's QP, small and well conditioned).
+    If that is infeasible the distance rows are relaxed through the penalised
+    slacks (module docstring), the same optimum whenever the hard problem is
+    feasible; only if the box and the limits themselves conflict (a velocity
+    limit approached faster than the torque rate can turn) are the limits
+    relaxed too. Returns ``z``, or ``None`` if OSQP fails throughout."""
     n = len(lb)
     P = reg * np.eye(n)
     q = np.zeros(n)
@@ -98,27 +104,45 @@ def solve_tracking_qp(tasks, lb, ub, rows: DistanceRows | None = None, reg: floa
     bad = lb > ub
     if np.any(bad):  # inconsistent box (state outside a limit): squeeze to a point
         lb[bad] = ub[bad]
-    m = 0 if rows is None else len(rows)
-    if m == 0:
-        return _osqp(P, q, np.eye(n), lb, ub)
+    none = (np.zeros((0, n)), np.zeros(0), np.zeros(0))
+    dist = none if rows is None or not len(rows) else (np.asarray(rows.A), np.asarray(rows.l),
+                                                         np.full(len(rows), np.inf))
+    lim = none if limits is None else tuple(np.asarray(x, dtype=float) for x in limits)
+    both = tuple(np.r_[a, b] if a.ndim == 1 else np.vstack([a, b]) for a, b in zip(dist, lim))
+    stages = [(both, none)]  # (hard, soft)
+    if len(dist[1]):
+        stages.append((lim, dist))
+    if len(lim[1]):
+        stages.append((none, both))
+    for hard, soft in stages:
+        z = _solve(P, q, lb, ub, hard, soft, slack_weight, slack_quad, max_iter=20000 if len(soft[1]) else 4000)
+        if z is not None:
+            return z
+    return None
 
-    A_rows = np.asarray(rows.A)
-    A = np.vstack([np.eye(n), A_rows])
-    z = _osqp(P, q, A, np.r_[lb, np.asarray(rows.l)], np.r_[ub, np.full(m, np.inf)])
-    if z is not None:
-        return z
-    # variables (z, s): box on z, a z + s >= lower, s >= 0, cost + rho sum(s) + rho2 |s|^2
+
+def _solve(P, q, lb, ub, hard, soft, slack_weight: float, slack_quad: float, max_iter: int):
+    """The box and the ``hard`` rows as constraints, the ``soft`` rows ``l <=
+    a z <= u`` through slacks ``s >= 0``: ``l <= a z + s``, ``a z - s <= u``,
+    at the cost ``rho sum(s) + rho2 |s|^2`` on top of the tracking cost."""
+    n, m = len(lb), len(soft[1])
+    A_h, l_h, u_h = hard
+    A_s, l_s, u_s = soft
     Pf = np.zeros((n + m, n + m))
     Pf[:n, :n] = P
     Pf[n:, n:] = slack_quad * np.eye(m)
-    qf = np.r_[q, np.full(m, 0.5 * slack_weight)]  # (the objective below is 2 Pf, 2 qf)
-    Af = np.zeros((n + 2 * m, n + m))
+    qf = np.r_[q, np.full(m, 0.5 * slack_weight)]  # (the objective of _osqp is 2 Pf, 2 qf)
+    k = len(l_h)
+    Af = np.zeros((n + k + 3 * m, n + m))
     Af[:n, :n] = np.eye(n)
-    Af[n:n + m, :n] = A_rows
-    Af[n:n + m, n:] = np.eye(m)
-    Af[n + m:, n:] = np.eye(m)
-    z = _osqp(Pf, qf, Af, np.r_[lb, np.asarray(rows.l), np.zeros(m)], np.r_[ub, np.full(2 * m, np.inf)],
-              max_iter=20000)
+    Af[n:n + k, :n] = A_h
+    r = n + k
+    Af[r:r + m, :n], Af[r:r + m, n:] = A_s, np.eye(m)
+    Af[r + m:r + 2 * m, :n], Af[r + m:r + 2 * m, n:] = A_s, -np.eye(m)
+    Af[r + 2 * m:, n:] = np.eye(m)
+    lf = np.r_[lb, l_h, l_s, np.full(m, -np.inf), np.zeros(m)]
+    uf = np.r_[ub, u_h, np.full(m, np.inf), u_s, np.full(m, np.inf)]
+    z = _osqp(Pf, qf, Af, lf, uf, max_iter=max_iter)
     return None if z is None else z[:n]
 
 

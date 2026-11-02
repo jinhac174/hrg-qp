@@ -170,7 +170,11 @@ class ReachPlanner:
     and a torque-controlled arm realises the jump with a lag the collision
     rows (linearised over ``H``) know nothing about. Bounded, the command is
     a velocity profile the arm can follow (``hrg.lowlevel``), and the rows
-    stay feasible as long as ``v <= a H`` (docs/method.md, "Speed")."""
+    stay feasible as long as ``v <= a H`` (docs/method.md, "Speed"). The
+    torque that profile asks of the arm is bounded too (``_arm_limits``):
+    within the FR3's torque, and changed from the previous plan by at most its
+    torque rate over the period, the rest of the joints' accelerations
+    included through ``M(q)``."""
 
     def __init__(self, params: HRGParams, robot: RobotModel, targets: FingertipTargets,
                  obj_sdf: PosedSDF, table_z: float = 0.0, plan_dt: float = 0.01,
@@ -183,6 +187,7 @@ class ReachPlanner:
         self.plan_dt = float(plan_dt)
         self.z_accel = np.r_[robot.qdd_limit, float(width_accel)]  # (8,) acceleration limits of z
         self._z_prev = None  # the previous plan (acceleration anchor); None: at rest / unknown
+        self._a_prev = None  # its acceleration (torque-rate anchor); None: zero
         self.path_field = FingertipPathField(
             v_const=params.v_const, delta_x=params.delta_x, num_knots=params.num_knots,
             num_via_samples=params.num_via_samples, via_dist=params.via_dist,
@@ -206,20 +211,23 @@ class ReachPlanner:
         self._choice = None
         self._q_grasp = None
         self._z_prev = None  # at rest, unless set_velocity says otherwise
+        self._a_prev = None
 
     def set_velocity(self, qd, wd: float = 0.0) -> None:
         """The acceleration anchor for the next plan: the velocity the arm
         actually has (the first plan after a pause, a push, a new controller)."""
         self._z_prev = np.r_[np.asarray(qd, dtype=float), float(wd)]
+        self._a_prev = None
 
     def _finish(self, z, ok: bool) -> np.ndarray:
-        """Record the plan as the next acceleration anchor. A failed QP
-        (``ok`` False) decelerates from the previous plan at the limit
+        """Record the plan and its acceleration as the next anchors. A failed
+        QP (``ok`` False) decelerates from the previous plan at the limit
         instead of stopping dead."""
+        prev = np.zeros(N_Z) if self._z_prev is None else self._z_prev
         if not ok:  # brake toward rest at the acceleration limit
-            prev = np.zeros(N_Z) if self._z_prev is None else self._z_prev
             z = prev - np.clip(prev, -self.z_accel * self.plan_dt, self.z_accel * self.plan_dt)
         self._z_prev = np.asarray(z, dtype=float).copy()
+        self._a_prev = (self._z_prev - prev) / self.plan_dt
         return self._z_prev.copy()
 
     def tcp_pose(self, q: np.ndarray) -> np.ndarray:
@@ -232,9 +240,9 @@ class ReachPlanner:
         ``(v (3,), omega (3,))`` in the world (a carried object; ``None`` at
         rest). The targets then move with it, which the fingertip fields
         get as a feed-forward (``xdot_des + v_target``: the field alone
-        trails a moving target by ``v / K``), and its collision rows know it
-        is coming (``DistanceRows.add(drift=...)``). ``None`` if no target
-        is valid."""
+        trails a moving target by ``v / K``), the fingertip speed still at
+        most ``v_const``, and its collision rows know it is coming
+        (``DistanceRows.add(drift=...)``). ``None`` if no target is valid."""
         p = self.p
         v_obj, om_obj = (np.zeros(3), np.zeros(3)) if obj_twist is None else (np.asarray(obj_twist[0], float),
                                                                                np.asarray(obj_twist[1], float))
@@ -273,6 +281,13 @@ class ReachPlanner:
             xd_des = linear_fingertip_field(x, x_tgt, p.linear_gain)
         if obj_twist is not None:  # the targets ride on the object: feed their velocity forward
             xd_des = xd_des + v_obj + np.cross(om_obj, x_tgt - T_obj[:3, 3])
+            # ... but the fingertips never move faster than the field's own top speed (eq. 5's
+            # v_const): an object moved faster than that is chased at v_const and caught as it
+            # slows, not followed at its speed (1.1 m/s and the FR3's velocity limits by hand).
+            # One factor for both keeps their relative motion (the opening).
+            top = float(np.max(np.linalg.norm(xd_des, axis=1)))
+            if top > p.v_const:
+                xd_des = xd_des * (p.v_const / top)
 
         # 4. auxiliary fields; both pads are fixed in the TCP frame
         omega_des, g = grasp_stability_field(x, np.stack([T_tcp[:3, :3]] * 2), PAD_CONTACT_AXES)
@@ -301,7 +316,7 @@ class ReachPlanner:
         lb, ub = self._bounds(q, w)
         rows = self._rows(q, T_tcp, J_tcp, w, obstacles, with_object=True,
                           obj_twist=None if obj_twist is None else (v_obj, om_obj, T_obj[:3, 3]))
-        z = solve_tracking_qp(tasks, lb, ub, rows, reg=p.qp_reg)
+        z = solve_tracking_qp(tasks, lb, ub, rows, reg=p.qp_reg, limits=self._arm_limits(q))
         ok = z is not None
         z = self._finish(z, ok)
         return ReachStep(
@@ -481,20 +496,26 @@ class ReachPlanner:
         rows = self._rows(q, T, J, w, (), with_object=False)
         if held is not None and len(held):
             self.held_rows(T, J, held, held_eps, rows)
-        z = solve_tracking_qp([(J6, W * np.r_[om, v], 1.0)], lb, ub, rows, reg=self.p.qp_reg)
+        z = solve_tracking_qp([(J6, W * np.r_[om, v], 1.0)], lb, ub, rows, reg=self.p.qp_reg,
+                              limits=self._arm_limits(q))
         return self._finish(z, z is not None)[:N_ARM]
 
     def held_rows(self, T_tcp: np.ndarray, J_tcp: np.ndarray, P_tcp: np.ndarray, eps: float,
                   rows: DistanceRows, reach: float = 0.15) -> None:
         """Rows keeping the held object's points (TCP frame) ``eps`` above
-        the table; only points within ``reach`` of it (the QP stays small)."""
+        the table; only points within ``reach`` of it (the QP stays small).
+        A point closer than ``eps`` (the object rests on the table at the
+        grasp) may only not come closer: the rows keep it off the table, the
+        lift raises it. Demanding the margin back from rest is infeasible and
+        the QP's fallback then raised it the fastest way the box allows, a
+        kick through every joint at its acceleration limit."""
         C = to_world(T_tcp, P_tcp)
         near = C[:, 2] - self.table.z0 < eps + reach
         if not np.any(near):
             return
         Jp = point_jacobians(T_tcp, J_tcp, P_tcp[near], np.zeros((int(near.sum()), 3)))
         d, grad = self.table.dist_grad(C[near])
-        rows.add(d, np.einsum("ki,kij->kj", grad, Jp), eps, "held:table")
+        rows.add(d, np.einsum("ki,kij->kj", grad, Jp), np.minimum(eps, d), "held:table")
 
     def upright_goal(self, T_tcp: np.ndarray, T_tcp_obj: np.ndarray, P_obj: np.ndarray, clearance: float,
                      position=None):
@@ -531,7 +552,7 @@ class ReachPlanner:
         if vmax is not None:
             v = _saturate(v, vmax)
         z = solve_tracking_qp([(Jq, v, 1.0)], lb, ub, self._rows(q, T, J, w, (), with_object=False),
-                              reg=self.p.qp_reg)
+                              reg=self.p.qp_reg, limits=self._arm_limits(q))
         return self._finish(z, z is not None)[:N_ARM]
 
     # ------------------------------------------------------------ QP pieces
@@ -558,6 +579,31 @@ class ReachPlanner:
         lo[bad] = np.where(z_prev[bad] > ub[bad], lb_a[bad], ub_a[bad])
         hi[bad] = lo[bad]
         return lo, hi
+
+    def _arm_limits(self, q):
+        """What the arm's actuators can do, as rows ``l <= A z <= u`` on ``z``
+        (hard like the box, ``hrg.qp``). The torque the plan asks of the arm
+        (``RobotModel.torque_bounds``): its acceleration is ``(z - z_prev) /
+        plan_dt``, ``z_prev``'s the velocity of the Coriolis term; row ``i`` is
+        divided by ``M_ii / plan_dt``, i.e. in rad/s like the box (OSQP's
+        tolerances are absolute). And the jerk (``RobotModel.qddd_limit``):
+        each joint's acceleration changes from the previous plan's by at most
+        ``qddd_limit plan_dt``."""
+        dt = self.plan_dt
+        z_prev = np.zeros(N_Z) if self._z_prev is None else self._z_prev
+        a_prev = np.zeros(N_Z) if self._a_prev is None else self._a_prev
+        v = z_prev[:N_ARM]
+        M, lo, hi = self.robot.torque_bounds(q, v, a_prev[:N_ARM], dt, self._data)
+        d = np.diag(M)
+        A = np.zeros((N_ARM, N_Z))
+        A[:, :N_ARM] = M / d[:, None]
+        lo, hi = (lo * dt + M @ v) / d, (hi * dt + M @ v) / d
+        if self.robot.qddd_limit is not None:
+            c = v + a_prev[:N_ARM] * dt
+            dj = self.robot.qddd_limit * dt * dt
+            A = np.vstack([A, np.eye(N_ARM, N_Z)])
+            lo, hi = np.r_[lo, c - dj], np.r_[hi, c + dj]
+        return A, lo, hi
 
     def _rows(self, q, T_tcp, J_tcp, w, obstacles, with_object: bool, obj_twist=None) -> DistanceRows:
         """``obj_twist``: ``(v, omega, p_obj)`` of a moving target object: its

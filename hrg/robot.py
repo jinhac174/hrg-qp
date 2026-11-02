@@ -28,6 +28,7 @@ import fcl
 import numpy as np
 import pinocchio as pin
 
+from fr3.robot_platform import fr3_limits
 from fr3.utils.fcl.getter import get_fcl_geom
 from fr3.utils.lie.kinematics import get_point_Jacobian
 from fr3.utils.pinocchio.getter import get_fk_link_pose, get_link_Jacobian
@@ -36,8 +37,6 @@ from hrg.paths import resolve
 from hrg.qp import DistanceRows
 
 TCP_LINK = "fr3_gripper_tcp"
-# rad/s^2, the FR3's joint acceleration limits (datasheet); config joint_acceleration_limit
-FR3_QDD_LIMIT = (10.0, 10.0, 10.0, 10.0, 15.0, 20.0, 20.0)
 
 
 def _pad(A7: np.ndarray) -> np.ndarray:
@@ -65,15 +64,25 @@ class RobotModel:
     """One Pinocchio ``Data`` per user thread: ``data()`` makes a new one."""
 
     def __init__(self, urdf_path: str, joint_velocity_limit, env_pairs=(), self_pairs=(),
-                 env_margin: float = 0.02, self_margin: float = 0.02, joint_acceleration_limit=None):
+                 env_margin: float = 0.02, self_margin: float = 0.02, joint_acceleration_limit=None,
+                 velocity_limit_scale: float = 0.8, torque_limit_scale: float = 0.8, joint_jerk_limit=None):
         self.model = pin.buildModelFromUrdf(resolve(urdf_path))
         if self.model.nq != N_ARM:
             raise ValueError(f"{urdf_path}: expected {N_ARM} joints, got {self.model.nq}")
         self.q_lower = self.model.lowerPositionLimit.copy()
         self.q_upper = self.model.upperPositionLimit.copy()
         self.qd_limit = np.asarray(joint_velocity_limit, dtype=float)
-        self.qdd_limit = np.asarray(FR3_QDD_LIMIT if joint_acceleration_limit is None else joint_acceleration_limit,
+        self.qdd_limit = np.asarray(fr3_limits.DDQ_MAX if joint_acceleration_limit is None else joint_acceleration_limit,
                                     dtype=float)
+        # fraction of the FR3's position-dependent velocity limits planned with: the arm follows
+        # a command with an error, and the robot stops at the limit itself
+        self.velocity_limit_scale = float(velocity_limit_scale)
+        # fraction of the FR3's torque and torque rate a plan's feed-forward may use: the rest
+        # is the feedback's (Kd) and the held object's
+        self.torque_limit_scale = float(torque_limit_scale)
+        # how fast a joint's acceleration may change (rad/s^3; None: no bound): the FR3's
+        # torque follows its command with a lag, and a faster change is not followed
+        self.qddd_limit = None if joint_jerk_limit is None else np.asarray(joint_jerk_limit, dtype=float)
         self.env_pairs = [tuple(p) for p in env_pairs]
         self.self_pairs = [tuple(p) for p in self_pairs]
         self.env_margin = float(env_margin)
@@ -106,16 +115,42 @@ class RobotModel:
 
     # ------------------------------------------------------------ limits
     def velocity_bounds(self, q, horizon: float):
-        """Joint-velocity box: velocity limits and the position limits reached
-        within ``horizon`` (``q`` clipped into the range first, so a slight
-        overshoot of a limit cannot make the box empty)."""
+        """Joint-velocity box: the velocity limits (``joint_velocity_limit``
+        and ``velocity_limit_scale`` times the FR3's own at ``q``, which fall
+        toward the ends of each joint's range: ``fr3_limits``) and the
+        position limits reached within ``horizon`` (``q`` clipped into the
+        range first, so a slight overshoot of a limit cannot make the box
+        empty)."""
         H = max(float(horizon), 1e-4)
         qc = np.clip(q, self.q_lower, self.q_upper)
-        lo = np.maximum(-self.qd_limit, (self.q_lower - qc) / H)
-        hi = np.minimum(self.qd_limit, (self.q_upper - qc) / H)
+        fr3_lo, fr3_hi = fr3_limits.joint_velocity_limits(q)
+        s = self.velocity_limit_scale
+        lo = np.maximum.reduce([-self.qd_limit, s * fr3_lo, (self.q_lower - qc) / H])
+        hi = np.minimum.reduce([self.qd_limit, s * fr3_hi, (self.q_upper - qc) / H])
         bad = hi < lo
         mid = 0.5 * (lo + hi)
         return np.where(bad, mid, lo), np.where(bad, mid, hi)
+
+    def torque_bounds(self, q, qd, a_prev, dt: float, data):
+        """Bounds ``lo <= M(q) a <= hi`` on the joint acceleration ``a`` held over
+        the next ``dt`` (a plan period) from the FR3's torque interface
+        (``fr3_limits``), ``torque_limit_scale`` of each: the torque
+        ``|M a + g + C qd| <= TAU_MAX`` and its rate, ``|M (a - a_prev)| <=
+        TAU_RATE_MAX dt`` (the inertial torque of the previous period's
+        ``a_prev`` changes by at most that within the period). Where the torque
+        range lies beyond one period's change (the load changed), the bound is
+        the change toward it. Returns ``(M, lo, hi)``."""
+        M = self.mass_matrix(q, data)
+        h = self.gravity_coriolis(q, qd, data)
+        s = self.torque_limit_scale
+        tau, step = s * fr3_limits.TAU_MAX, s * fr3_limits.TAU_RATE_MAX * float(dt)
+        prev = M @ np.asarray(a_prev, dtype=float)
+        lo = np.maximum(-tau - h, prev - step)
+        hi = np.minimum(tau - h, prev + step)
+        bad = hi < lo
+        toward = np.where(prev - step > tau - h, prev - step, prev + step)
+        lo[bad], hi[bad] = toward[bad], toward[bad]
+        return M, lo, hi
 
     # ------------------------------------------------------------ collision
     def set_collision_geometry(self, robot_col_info: dict, static_col_info: dict) -> None:

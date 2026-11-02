@@ -29,6 +29,38 @@ the object is held (`is_grasped`) 5 cm above its rest height within the time
 limit; trials where the bus or a process died are marked `infra` and
 repeated, never counted.
 
+## Within the FR3's own limits; one goal after the grasp (2026-11-02, after the first robot runs)
+
+On the robot the arm bounced after the lift and stopped itself twice while chasing a bowl moved by
+hand (`joint_velocity_violation`, `power_limit_violation`). Now (docs/method.md eq. 11 and "Grasp
+and lift"; docs/superpowers/specs/2026-11-02-speed-design.md, round three):
+
+- The QP plans within 0.8 of the FR3's **position-dependent** joint velocity limits (libfranka
+  0.17.0) and its 10 rad/s² on every joint (was 15 / 20 on the wrist).
+- The fingertips are never commanded faster than `v_const` (0.5 m/s), also on a moving object.
+- From the grasp on, the hand has **one goal**: the upright turn keeps the lift's position, and
+  the hold keeps the final pose.
+
+Measured on the workstation (rllab2), with the robot's perception running alongside:
+
+| | before | now |
+|---|---|---|
+| fast chase (gold bowl carried at up to 0.9 m/s, `env_carry_fast`): peak joint speed / FR3 limit | 135 % (joint 4 at −2.68 rad) | **82 %** |
+| same, commanded hand speed, peak | 1.10 m/s | 0.73 m/s (the 0.8 m/s lift; fingertips ≤ 0.5 m/s while chasing) |
+| gold bowl lift: TCP height after the lift | up 1.6 mm past the hold point, then down; held 1 cm short of the goal | monotonic, held at the goal |
+| Table I set (78 trials, as below) | 77 / 78 | **76 / 78** |
+| time from `v` to the object 5 cm up, median (max) | 1.9 s (5.4 s) | 1.9 s (5.9 s) |
+| object tilt at the end, median (max) | 2.9° (5.9°) | **0.6° (6.7°)**: the hold finishes the upright turn |
+| Fig. 7 / Fig. 8 / carried objects | 6 / 6, 6 / 6, 6 / 6 | 6 / 6 (lifted 3.0–3.5 s), 6 / 6 (1.7–2.0 s), 6 / 6 (1.5–1.8 s) |
+| kinematic rollouts (`scripts/rollout.py --orientations all --placements 5`) | 169 / 178 | 169 / 178 (the same 9 lying mugs) |
+
+The Table I trial lost is the mug on its side (−90° about x), placement 2, from the left-bottom
+start. It is deterministic (2 / 2 each way). Its reach drives joint 4 toward the end of its range
+(−3.0 rad). Under the old box it got through only by moving joint 4 at 1.9× the planning limit,
+about 150 % of the FR3's real limit there, so on the robot it would have stopped with
+`joint_velocity_violation`. Within the limit the reach slows joint 4 and ends in the same local
+minimum as the center-up start (two finger spheres on the object's margin, 4.7 cm short).
+
 ## Fast defaults: acceleration-bounded planning and inertia feed-forward (2026-11-02)
 
 The sections after this one were measured with the earlier defaults
@@ -123,7 +155,7 @@ the hand within 10° of its target orientation (the grasp trigger).
 | | converged | hand vs R* at the end | joint 7 turn |
 |---|---|---|---|
 | paper's reach (`hrg.orient=false`) | 172 / 178 | (not steered) | — |
-| oriented reach | 169 / 178 | ≤ 10° (the trigger) | ≤ 110° |
+| oriented reach | 169 / 178 | ≤ 10° (the trigger) | ≤ 114° |
 
 The 9 failures are all a mug lying on its side:
 - **6 placements, no reachable oriented grasp:** the planner reports it and holds. Every
@@ -142,10 +174,16 @@ so its stem or foot is taken.
 wine_glass --orientations all --seeds 2 --timeout 30`): grasp + lift within 30 s, then the
 object's tilt once held, after the upright turn.
 - **78 / 78** grasped, lifted and still held at the end, with no failed closes.
-- Lift time: median 5.4 s, at most 8.5 s after `v`.
-- The object's tilt at the end: at most 5.4° (median 2.8°), including the 48 trials that
+- Lift time: median 5.3 s, at most 7.8 s after `v`.
+- The object's tilt at the end: at most 5.0° (median 2.8°), including the 48 trials that
   started lying on their side (83–89°).
-- Gold bowl: 6 / 6, ending within 2° of upright.
+- Gold bowl: 6 / 6, ending within 2.5° of upright.
+
+**Under pose noise** (kinematic rollouts, gold bowl, the object pose perturbed every plan): the
+grasp is chosen once and kept while reachable. With 2 mm / 1° and 4 mm / 2° noise, every reach
+converges with no switch of the grasp. Re-choosing every plan, as in the paper's eq. 12,
+switched 55–93 times per reach at 2 mm / 1° and made the targets jump up to 13 cm. The measured
+FoundationPose jitter on the robot is 1.2 mm / 0.6° per frame (median) at rest.
 
 **Friction identification in the simulation**
 (`scripts/robot/identify_friction.py`, against MuJoCo's own friction):

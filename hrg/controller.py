@@ -26,9 +26,11 @@ At the *measured* joints ``q`` and width ``w`` (the feedback of the method):
   turned until it is upright. The object
   lost (``is_grasped`` false) in ``lift``, ``upright`` or ``hold``: open and
   reach again.
-* ``idle`` / ``close`` / ``reopen`` / ``hold``: hold the joints where the
-  state began (``hold_gain (q_hold - q)``, through the planner like every
-  other motion).
+* ``hold``: keep the held object at the goal pose of the lift / upright
+  (the same pose field): from the grasp on the hand has one goal, so it
+  never overshoots a point it was re-anchored at while moving.
+* ``idle`` / ``close`` / ``reopen``: hold the joints where the state began
+  (``hold_gain (q_hold - q)``, through the planner like every other motion).
 * ``home`` (key ``h``): joint-space field to ``default_q_values`` through the
   same QP.
 
@@ -51,9 +53,11 @@ qdd_cmd`` (``inertia_ff``) feeds the command's acceleration forward: the Kd
 loop alone follows a velocity command with the time constant ``M_ii / Kd_i``
 (30-60 ms on joints 1-4), which the QP horizon had to cover and which at speed
 overshoots the collision margins; with it the arm follows the planned
-velocity profile and ``Kd`` only corrects errors. The plans change by at most
-the acceleration limits per period (the QP), so the ramp's acceleration is
-what the robot can do and the torque has no steps.
+velocity profile and ``Kd`` only corrects errors. The QP keeps each plan's
+torque ``M a + g + C v`` within the FR3's torque and its change within the
+torque rate over the period (``RobotModel.torque_bounds``), and ``M(q)
+qdd_cmd`` moves to each plan's value at that rate: a ramp, not a step the FR3
+rate-limits (holding back the Kd term with it).
 ``ref_mode: integral`` is the earlier variant, ``q_des <- q_des + qd_cmd dt``
 within ``max_ref_err`` of ``q`` (with ``kp`` > 0 an integral of the velocity
 error). ``tau_f`` is the friction feed-forward on the *commanded* velocity,
@@ -93,6 +97,7 @@ from fr3.data_type.basic_types.JointCtrlData import JointCtrlData
 from fr3.data_type.basic_types.JointMeasData import JointMeasData
 from fr3.data_type.basic_types.NamedVecListData import NamedVecListData
 from fr3.data_type.basic_types.SE3PoseData import SE3PoseData
+from fr3.robot_platform import fr3_limits
 from hrg import obstacles as obstacle_msg
 from fr3.utils.lie.so3 import skew
 from hrg.friction import friction_torque
@@ -125,6 +130,9 @@ class HRGController(BaseController):
             env_pairs=config["col_pairs"], self_pairs=config["self_col_pairs"],
             env_margin=float(config["env_col_margin"]), self_margin=float(config["self_col_margin"]),
             joint_acceleration_limit=config.get("joint_acceleration_limit", None),
+            velocity_limit_scale=float(config.get("joint_velocity_limit_scale", 0.8)),
+            torque_limit_scale=float(config.get("joint_torque_limit_scale", 0.8)),
+            joint_jerk_limit=config.get("joint_jerk_limit", None),
         )
         self._obj = GraspObject(config["object_config"])
         self._params = HRGParams.from_config(config["hrg"])
@@ -177,6 +185,9 @@ class HRGController(BaseController):
         self._fr_vs = float(fr.get("v_smooth", 0.02))
         self._fr_max = np.asarray(fr.get("max", [1.0] * N_ARM), dtype=float)
         self._inertia_ff = bool(config.get("inertia_ff", True))
+        self._tau_inertia = np.zeros(N_ARM)  # the inertial feed-forward sent, moved at _tau_rate
+        self._t_inertia = None  # when it was last moved
+        self._tau_rate = self._robot.torque_limit_scale * fr3_limits.TAU_RATE_MAX
         self._max_ref_err = float(config["max_ref_err"])
         self._max_plan_age = float(config["max_plan_age"])
         self._ramp = VelocityRamp(N_Z, self._plan_dt)
@@ -498,27 +509,25 @@ class HRGController(BaseController):
                     print("[HRG] Object lost: opening, reaching again.")
                     self._reopen()
                     return self._hold_plan(q, w)
-                if state == "hold":
-                    return self._hold_plan(q, w)
+                # One goal pose from the grasp on (_T_lift): lifted, turned upright, then held
+                # there. (A goal re-anchored where the hand was when a state ended, still moving
+                # up, made it overshoot that point and come back down.)
                 T_tcp = self._planner.tcp_pose(q)
-                if state == "lift":
-                    if (np.linalg.norm(T_tcp[:3, 3] - self._T_lift[:3, 3]) <= self._lift_tol
-                            or time.time() - self._lift_t0 > self._lift_timeout):
-                        return self._after_lift(q, w, T_tcp, T_obj)
-                    return Plan(self._planner.lift_step(q, w, self._T_lift, **self._lift_cfg,
-                                                        held=self._held_tcp(), held_eps=self._held_eps))
-                # upright: a feedback loop on the object's tilt in the hand (refreshed by the
-                # tracker when plausible), the goal recomputed every plan
-                self._refresh_in_hand(T_tcp, T_obj)
-                T_up, tilt = self._planner.upright_goal(T_tcp, self._T_tcp_obj, self._held_pts,
-                                                        self._upright_clearance, self._T_lift[:3, 3])
-                if ((tilt <= self._upright_tol and np.linalg.norm(T_tcp[:3, 3] - T_up[:3, 3]) <= self._lift_tol)
-                        or time.time() - self._lift_t0 > self._upright_timeout):
-                    print(f"[HRG] Upright ({np.degrees(tilt):.1f} deg, {time.time() - self._t_start:.1f} s). "
-                          "Press x to release.")
-                    self._enter("hold")
-                    return self._hold_plan(q, w)
-                return Plan(self._planner.lift_step(q, w, T_up, **self._lift_cfg,
+                if state == "lift" and (np.linalg.norm(T_tcp[:3, 3] - self._T_lift[:3, 3]) <= self._lift_tol
+                                        or time.time() - self._lift_t0 > self._lift_timeout):
+                    self._after_lift(T_tcp, T_obj)
+                elif state == "upright":
+                    # a feedback loop on the object's tilt in the hand (refreshed by the tracker
+                    # when plausible), the goal recomputed every plan at the lifted position
+                    self._refresh_in_hand(T_tcp, T_obj)
+                    self._T_lift, tilt = self._planner.upright_goal(T_tcp, self._T_tcp_obj, self._held_pts,
+                                                                    self._upright_clearance, self._T_lift[:3, 3])
+                    if ((tilt <= self._upright_tol and np.linalg.norm(T_tcp[:3, 3] - self._T_lift[:3, 3]) <= self._lift_tol)
+                            or time.time() - self._lift_t0 > self._upright_timeout):
+                        print(f"[HRG] Upright ({np.degrees(tilt):.1f} deg, {time.time() - self._t_start:.1f} s). "
+                              "Press x to release.")
+                        self._enter("hold")
+                return Plan(self._planner.lift_step(q, w, self._T_lift, **self._lift_cfg,
                                                     held=self._held_tcp(), held_eps=self._held_eps))
             if state == "reopen":
                 if self._gripper_done(gs) is not None:
@@ -548,21 +557,22 @@ class HRGController(BaseController):
         self._set_held()
         return True
 
-    def _after_lift(self, q, w, T_tcp, T_obj) -> Plan:
-        """Lifted: turn the object upright (``upright``) or hold."""
+    def _after_lift(self, T_tcp, T_obj) -> None:
+        """Lifted: turn the object upright at the lifted position (``upright``)
+        or hold the lifted pose (``hold``)."""
         self._refresh_in_hand(T_tcp, T_obj)
         tilt = 0.0
         if self._upright and self._T_tcp_obj is not None:
-            T_up, tilt = self._planner.upright_goal(T_tcp, self._T_tcp_obj, self._held_pts, self._upright_clearance)
+            T_up, tilt = self._planner.upright_goal(T_tcp, self._T_tcp_obj, self._held_pts,
+                                                    self._upright_clearance, self._T_lift[:3, 3])
         if tilt <= self._upright_tol:
             print(f"[HRG] Lifted ({time.time() - self._t_start:.1f} s). Press x to release.")
             self._enter("hold")
-            return self._hold_plan(q, w)
+            return
         print(f"[HRG] Lifted ({time.time() - self._t_start:.1f} s); turning the object upright "
               f"({np.degrees(tilt):.0f} deg).")
-        self._T_lift, self._lift_t0 = T_up, time.time()  # its position stays the goal's
+        self._T_lift, self._lift_t0 = T_up, time.time()
         self._enter("upright")
-        return self._hold_plan(q, w)
 
     def _reach(self, q, w, T_obj, obstacles) -> Plan:
         t0 = time.perf_counter()
@@ -637,7 +647,14 @@ class HRGController(BaseController):
         tau_ff = (self._robot.gravity_coriolis(q, qd, self._pin_ctrl) + self.friction(qd_cmd)
                   + self._payload_torque(q))
         if self._inertia_ff:
-            tau_ff = tau_ff + self._robot.mass_matrix(q, self._pin_ctrl) @ qdd_cmd
+            # at the torque rate the plans are bounded by (RobotModel.torque_bounds): each plan's
+            # change arrives within its period as a ramp, not as a step the FR3 rate-limits
+            # (which holds back the Kd term with it). Per elapsed time: a late tick catches up.
+            step = self._tau_rate * (self._ctrl_dt if self._t_inertia is None else max(t - self._t_inertia, 0.0))
+            self._t_inertia = t
+            tau_in = self._robot.mass_matrix(q, self._pin_ctrl) @ qdd_cmd
+            self._tau_inertia = self._tau_inertia + np.clip(tau_in - self._tau_inertia, -step, step)
+            tau_ff = tau_ff + self._tau_inertia
         kp, kd = self._kp, self._kd
         if not fresh:  # no plan: hold the joints where the plans stopped
             if self._q_stale is None:

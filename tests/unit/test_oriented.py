@@ -231,6 +231,23 @@ def test_upright_goal_untilts_the_held_object_and_clears_the_table(gold):
     assert np.allclose(T_fix[:3, 3], [0.4, 0.1, 0.5])  # the goal position is kept (high enough)
 
 
+def test_held_object_rows_never_demand_separation(gold):
+    """A held point closer to the table than eps (the object rests on it at the
+    grasp) may only not approach: its row asks for no separation rate; a point
+    above eps keeps the margin as usual."""
+    p, _ = gold
+    q = np.array([0.2, 0.5, -0.1, -2.0, 0.1, 2.4, 0.3])
+    data = p.robot.data()
+    T = p.robot.pose(q, data)
+    # two points 0.5 cm and 5 cm above the table, in the TCP frame
+    W = np.array([[T[0, 3], T[1, 3], p.table.z0 + 0.005], [T[0, 3], T[1, 3], p.table.z0 + 0.05]])
+    P_tcp = (W - T[:3, 3]) @ T[:3, :3]
+    rows = DistanceRows(N_Z, 0.1, 0.25)
+    p.held_rows(T, p.robot.jacobian(q, data), P_tcp, 0.02, rows, reach=10.0)
+    assert rows.l[0] == pytest.approx(0.0, abs=1e-9)  # inside the margin: do not approach
+    assert rows.l[1] == pytest.approx(-(0.05 - 0.02) / 0.1)  # outside: approach the margin at (d - eps) / H
+
+
 def test_held_object_rows_are_the_table_distance_gradient(gold):
     """Rows keeping a held object's points above the table: ``d`` and its
     derivative in the joints (finite differences)."""
@@ -241,8 +258,9 @@ def test_held_object_rows_are_the_table_distance_gradient(gold):
 
     def rows_at(qq):
         rows = DistanceRows(N_Z, 1.0, 1e9)
-        p.held_rows(p.robot.pose(qq, data), p.robot.jacobian(qq, data), P_tcp, 0.0, rows, reach=10.0)
-        return -np.array(rows.l), np.array(rows.A)[:, :7]  # H = 1, eps = 0: lower = -d
+        # eps far below every point (no point inside its margin): H = 1, lower = -(d - eps)
+        p.held_rows(p.robot.pose(qq, data), p.robot.jacobian(qq, data), P_tcp, -10.0, rows, reach=20.0)
+        return -np.array(rows.l) - 10.0, np.array(rows.A)[:, :7]
 
     d0, A = rows_at(q)
     h = 1e-6

@@ -75,6 +75,85 @@ guessed (`scripts/diagnose_tracking.py --carry_at`, kinematic replays of the rec
   `1.5 v² / δ` must fit the arm's acceleration (3.8 m/s² now; 12 before). Static reach 0.65 → 0.9 s
   kinematically; the user accepted the trade.
 
+## Round three: the first runs on the robot (same day)
+
+The user ran the gold bowl on the FR3 ("I love the speed, but ..."). Two things, measured in the
+logs and reproduced in the real-time simulation before anything was changed:
+
+* **The bounce after the lift** ("it lifts up with too much ease, overshoots up a little and comes
+  down"). The lift ends within 1 cm of its goal while the hand still rises; the upright turn then
+  took the hand's *current* position as its goal, and the hold the joints at its entry: each state
+  re-anchored the goal at a point the moving hand had to overshoot and come back to (2 mm in the
+  simulation, more on the robot, which follows with more lag). Fix: one goal pose from the grasp on
+  (the lift's position for the upright turn, the final pose for the hold, the same pose field).
+  The height now rises monotonically and stays.
+* **The robot stopping while chasing a bowl moved by hand** (`joint_velocity_violation`, then
+  `power_limit_violation`; the hardware log). Two causes: the target feed-forward added the object's
+  speed to the fields' (the hand went to 1.1 m/s, the arm at its 2 rad/s box), and the box itself
+  was not the robot's. The FR3's joint velocity limits depend on position and fall toward the ends
+  of the range (libfranka 0.17.0); in a simulated chase joint 4 reached 135 % of its limit at
+  −2.68 rad. And the acceleration limits of 15 / 20 rad/s² on the wrist were not the FR3's (10 on
+  every joint). Fix: the QP plans within 0.8 of the FR3's position-dependent limits at 10 rad/s²,
+  the fingertips never faster than `v_const` (an object moved faster is caught as it slows), the
+  hardware brakes above 0.9 of the same limits. Simulated chase: 82 % at most.
+* The hardware process did not notice a reflex (panda-py's torque loop ends in its own thread),
+  so every stop needed a restart. It now reports the robot's reasons, saves its last 3 s
+  (`outputs/logs/reflex_<time>.npz`) and recovers with `r`. The power limit's definition is not
+  published; the next stop's record shows what the arm did.
+
+## Round four: the torque the plans asked for (same day)
+
+The user ran it again with the bus recorded ("Same problem ... Acceleration is prob the problem"):
+the lift still overshot, and a fast reach ended in `power_limit_violation`. The recordings
+(`outputs/logs/bus_20261102_170917.lcm`, `bus_20261102_171141.lcm`) show why, and the user's guess
+was right:
+
+* The plans' accelerations were bounded per joint (10 rad/s²) but not together. Through `M(q)` the
+  feed-forward of a plan change asked for torque steps of 20–49 Nm within 1 ms (libfranka passes
+  1 Nm per ms: `kMaxTorqueRate` 1000 Nm/s) and, on the lift far out, 139 Nm of joint 2 (the FR3 has
+  87). The torque the robot measured (`tau_J`, which the arm's motion confirms through the URDF
+  dynamics) followed the command 20–60 ms late: the lift's braking arrived after the hand had
+  passed its goal (2.2 cm overshoot, then down), and on a fast reach the late Kd term pushed
+  joints 1 and 3 against each other (their antiphase mode weighs 0.27 kg m² there) at 8 Hz,
+  growing to ±2.4 rad/s until the power limit stopped the robot. The simulation had no torque-rate
+  limit, so it never showed any of this.
+* Fix (one constraint, where the plan is made): the QP bounds the torque each plan asks of the arm,
+  `|M â + g + C v| <= 0.8 τ_max` and `|M (â − â_prev)| <= 0.8 τ̇_max Δt` (8 Nm per plan), as hard
+  rows that give way only to the box; the low level ramps the inertial feed-forward at 0.8 τ̇_max
+  instead of stepping it, leaving the rest of the robot's torque rate to the Kd term. The
+  simulation now has the FR3's torque-rate limit.
+* `run_hardware.py` had not noticed this stop either: panda-py's `is_moving()` stays True after a
+  reflex; `raise_error()` is the documented check.
+
+## Round five: the lift start (same day)
+
+The user ran it ("Very jerky"). Both lifts shook joints 1 and 3 against each other at 8–9 Hz from
+the first 0.1 s of the lift; once it grew into `power_limit_violation`, once it died out. The new
+flight recorder had the torque actually sent, and showed:
+
+* The robot's link-side torque follows the command 1–7 ms late and with a 12–38 ms first-order lag
+  (joint 1 the slowest). Joints 1 and 3 turning against each other weigh 0.17–0.28 kg m² at the
+  lift (they are nearly coaxial), so the per-joint Kd = 50 is a ~300 /s loop there; the lighter
+  that motion, the worse the lift went (0.28 settled, 0.20 jerky, 0.17 the reflex).
+* With that torque response the simulation reproduces the robot (`configs/sim/env.yaml` now has
+  it; without it the simulated arm followed every plan): reach fine, then the shaking at the lift.
+* What started it was the plan. At the grasp the bowl rests on the table, so its 2 cm table rows
+  were violated; recovering that from rest is infeasible, and the QP's fallback raised the bowl
+  the fastest way the box allowed, with the torque rows now on the heavy joints, through the
+  light ones at ±10 rad/s², then switched back to the lift field, reversing them. Fix: a held
+  point closer than its margin may only not come closer (the lift raises it).
+* And plans in general switched joints between ±10 rad/s² from one period to the next (the QP
+  riding its box toward a field's demand), which the robot's torque cannot follow. Fix: a jerk
+  bound, `|â − â_prev| <= 300 rad/s³ · Δt` (10 rad/s² over the ~30 ms lag), in the same hard
+  rows as the torque. In the simulation with the torque response the per-joint Kd was then
+  stable from every start pose, where without it it shook from the low ones.
+* An inertia-shaped damping (`S M(q) S`, the per-joint Kd on the diagonal) was tried first, with
+  the user's go-ahead. It removed the oscillation too, but in light directions it is weak against
+  joint friction (a hold stopped 1 cm short) and it tracked worse than the per-joint Kd once the
+  plans were realisable. Not kept.
+* The lift's top speed is now 0.5 m/s (the reach's): the arm brakes one torque lag after its plan,
+  1.6 cm past the goal from 0.8 m/s in the simulation, none from 0.5.
+
 ## The governing relation
 
 `v <= a H`. A distance row allows approach at `(d − ε)/H`, so braking must deliver `v/H`; with
@@ -85,7 +164,8 @@ acceleration or a longer horizon (braking earlier).
 
 ## Anti-goals
 
-No thresholds or state rules were added. Everything is a constraint the robot has (acceleration), a
+No thresholds or state rules were added. Everything is a constraint the robot has (acceleration,
+torque and torque rate), a
 penalty formulation that keeps a constrained problem solvable, the dynamics the paper's PD left out
 (inertia), or the gripper's own interface (speed per set-point).
 
